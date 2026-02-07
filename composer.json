@@ -1,0 +1,57 @@
+{
+    "name": "webo3/laravel-query-cache",
+    "description": "Transparent query-level database caching for Laravel with smart table-based invalidation.",
+    "type": "library",
+    "keywords": [
+        "laravel",
+        "database",
+        "cache",
+        "query-cache",
+        "mysql",
+        "postgresql",
+        "sqlite",
+        "performance"
+    ],
+    "license": "MIT",
+    "require": {
+        "php": "^8.1",
+        "illuminate/database": "^9.0|^10.0|^11.0|^12.0",
+        "illuminate/support": "^9.0|^10.0|^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^7.0|^8.0|^9.0|^10.0",
+        "phpunit/phpunit": "^9.5|^10.0|^11.0",
+        "predis/predis": "^3.3"
+    },
+    "suggest": {
+        "predis/predis": "Required for the Redis cache driver",
+        "ext-igbinary": "For faster serialization in the Redis driver",
+        "ext-redis": "For phpredis-based Redis connections"
+    },
+    "autoload": {
+        "psr-4": {
+            "webO3\\LaravelQueryCache\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "webO3\\LaravelQueryCache\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "webO3\\LaravelQueryCache\\QueryCacheServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit --no-coverage",
+        "test-coverage": "vendor/bin/phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
