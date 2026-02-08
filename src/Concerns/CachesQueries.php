@@ -32,6 +32,11 @@ trait CachesQueries
     private bool $inCursorQuery = false;
 
     /**
+     * Per-request cache for normalized queries to avoid redundant normalization
+     */
+    private static array $normalizedQueryCache = [];
+
+    /**
      * Initialize the caching subsystem. Must be called from the
      * connection class constructor after parent::__construct().
      */
@@ -156,7 +161,14 @@ trait CachesQueries
     private function generateCacheKey(string $query, array $bindings): string
     {
         $normalizedQuery = $this->normalizeQuery($query);
-        return md5($normalizedQuery . json_encode($bindings));
+        $raw = $normalizedQuery . json_encode($bindings);
+
+        // Use xxh128 (PHP 8.1+) for ~5-10x faster hashing than md5
+        if (function_exists('hash')) {
+            return hash('xxh128', $raw);
+        }
+
+        return md5($raw);
     }
 
     /**
@@ -167,11 +179,16 @@ trait CachesQueries
      */
     private function normalizeQuery(string $query): string
     {
-        $query = trim($query);
-        $query = strtoupper($query);
-        $query = preg_replace('/\s+/', ' ', $query);
+        // Check per-request cache first to avoid redundant normalization
+        if (isset(self::$normalizedQueryCache[$query])) {
+            return self::$normalizedQueryCache[$query];
+        }
 
-        return $query;
+        $normalized = preg_replace('/\s+/', ' ', strtoupper(trim($query)));
+
+        self::$normalizedQueryCache[$query] = $normalized;
+
+        return $normalized;
     }
 
     /**

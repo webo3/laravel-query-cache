@@ -22,6 +22,12 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
     private static array $cache = [];
 
     /**
+     * Inverted table index: table_name => [key1, key2, ...]
+     * Enables O(1) lookup of cache keys by table name during invalidation
+     */
+    private static array $tableIndex = [];
+
+    /**
      * Configuration
      */
     private array $config;
@@ -53,15 +59,23 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
         // Evict if needed before adding new entry
         $this->evictIfNeeded();
 
+        // Extract tables eagerly for O(1) invalidation via inverted index
+        $tables = SqlTableExtractor::extract($query);
+
         $now = microtime(true);
         self::$cache[$key] = [
             'result' => $result,
-            'tables' => null, // Lazy-load tables only when needed for invalidation
+            'tables' => $tables,
             'query' => $query,
             'executed_at' => $executedAt,
             'last_accessed' => $now,
             'hits' => 0
         ];
+
+        // Add to inverted table index
+        foreach ($tables as $table) {
+            self::$tableIndex[$table][$key] = true;
+        }
     }
 
     /**
@@ -77,6 +91,7 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
      */
     public function forget(string $key): void
     {
+        $this->removeFromTableIndex($key);
         unset(self::$cache[$key]);
     }
 
@@ -89,6 +104,7 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
             // If we can't determine tables, clear all cache to be safe
             $clearedCount = count(self::$cache);
             self::$cache = [];
+            self::$tableIndex = [];
 
             if ($clearedCount > 0 && $this->config['log_enabled']) {
                 Log::debug('Query Cache: Cleared entire cache (could not determine affected tables)', [
@@ -99,22 +115,23 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
             return $clearedCount;
         }
 
-        $invalidatedCount = 0;
-        foreach (self::$cache as $key => $cached) {
-            // Lazy-load tables only when needed for invalidation
-            if ($cached['tables'] === null) {
-                $cached['tables'] = SqlTableExtractor::extract($cached['query']);
-                self::$cache[$key]['tables'] = $cached['tables'];
-            }
-
-            $cachedTables = $cached['tables'];
-
-            // If any table overlaps, invalidate the cache entry
-            if (array_intersect($tables, $cachedTables)) {
-                unset(self::$cache[$key]);
-                $invalidatedCount++;
+        // O(1) lookup per table using inverted index instead of scanning all cache entries
+        $keysToInvalidate = [];
+        foreach ($tables as $table) {
+            if (isset(self::$tableIndex[$table])) {
+                foreach (self::$tableIndex[$table] as $key => $_) {
+                    $keysToInvalidate[$key] = true;
+                }
             }
         }
+
+        // Remove matched entries and clean up indexes
+        foreach ($keysToInvalidate as $key => $_) {
+            $this->removeFromTableIndex($key);
+            unset(self::$cache[$key]);
+        }
+
+        $invalidatedCount = count($keysToInvalidate);
 
         if ($invalidatedCount > 0 && $this->config['log_enabled']) {
             Log::debug('Query Cache: Invalidated cached queries', [
@@ -133,6 +150,7 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
     public function flush(): void
     {
         self::$cache = [];
+        self::$tableIndex = [];
     }
 
     /**
@@ -209,6 +227,7 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
                 if ($removed >= $toRemove) {
                     break;
                 }
+                $this->removeFromTableIndex($key);
                 unset(self::$cache[$key]);
                 $removed++;
             }
@@ -218,6 +237,20 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
                     'evicted_count' => $removed,
                     'remaining_count' => count(self::$cache)
                 ]);
+            }
+        }
+    }
+
+    /**
+     * Remove a cache key from all its table indexes
+     */
+    private function removeFromTableIndex(string $key): void
+    {
+        $tables = self::$cache[$key]['tables'] ?? [];
+        foreach ($tables as $table) {
+            unset(self::$tableIndex[$table][$key]);
+            if (empty(self::$tableIndex[$table])) {
+                unset(self::$tableIndex[$table]);
             }
         }
     }

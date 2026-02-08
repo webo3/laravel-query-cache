@@ -8,13 +8,25 @@ namespace webO3\LaravelDbCache\Utils;
 class SqlTableExtractor
 {
     /**
+     * Per-request cache of extracted tables keyed by SQL string
+     */
+    private static array $cache = [];
+
+    /**
      * Extract table names from SQL query
+     *
+     * Results are cached per-request so repeated extraction of the same
+     * query (e.g. during invalidation + stats) is free.
      *
      * @param string $sql
      * @return array
      */
     public static function extract(string $sql): array
     {
+        if (isset(self::$cache[$sql])) {
+            return self::$cache[$sql];
+        }
+
         $tables = [];
 
         // Identifier quoting: MySQL uses backticks, PostgreSQL uses double quotes, SQLite uses brackets or double quotes
@@ -61,6 +73,9 @@ class SqlTableExtractor
             $tables[] = $matches[1];
         }
 
-        return array_unique($tables);
+        $result = array_values(array_unique($tables));
+        self::$cache[$sql] = $result;
+
+        return $result;
     }
 }

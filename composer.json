@@ -21,6 +21,7 @@
     },
     "require-dev": {
         "orchestra/testbench": "^7.0|^8.0|^9.0|^10.0",
+        "phpbench/phpbench": "^1.4",
         "phpunit/phpunit": "^9.5|^10.0|^11.0",
         "predis/predis": "^3.3"
     },
@@ -36,7 +37,8 @@
     },
     "autoload-dev": {
         "psr-4": {
-            "webO3\\LaravelDbCache\\Tests\\": "tests/"
+            "webO3\\LaravelDbCache\\Tests\\": "tests/",
+            "webO3\\LaravelDbCache\\Benchmarks\\": "benchmarks/"
         }
     },
     "extra": {
@@ -48,7 +50,8 @@
     },
     "scripts": {
         "test": "vendor/bin/phpunit --no-coverage",
-        "test-coverage": "vendor/bin/phpunit"
+        "test-coverage": "vendor/bin/phpunit",
+        "bench": "vendor/bin/phpbench run --report=default"
     },
     "config": {
         "sort-packages": true
