@@ -33,6 +33,14 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     private string $tableIndexPrefix = 'db_cache:table:';
 
     /**
+     * Redis Set tracking every table that has an index, so flush can iterate
+     * without SCAN. SCAN returns raw (client-prefixed) keys which can't be
+     * round-tripped back through the Redis client without double-prefixing.
+     * Dynamically prefixed with tenant context when set.
+     */
+    private string $tablesSet = 'db_cache:tables';
+
+    /**
      * Current tenant ID for cache isolation
      */
     private ?string $tenantId = null;
@@ -81,6 +89,7 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         $this->tenantId = $tenantId;
         $this->keysSet = "db_cache:t:{$tenantId}:keys";
         $this->tableIndexPrefix = "db_cache:t:{$tenantId}:table:";
+        $this->tablesSet = "db_cache:t:{$tenantId}:tables";
 
         // Flush L1 cache on tenant switch to prevent cross-tenant leakage
         $this->requestCache = [];
@@ -530,6 +539,7 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                 foreach ($tables as $table) {
                     $indexKey = $this->tableIndexPrefix . $table;
                     $pipe->sadd($indexKey, $key);
+                    $pipe->sadd($this->tablesSet, $table);
                 }
             });
         } catch (\Exception $e) {
@@ -725,37 +735,29 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     /**
      * Clear all table-based indexes
      *
-     * Uses SCAN to find and delete all table index keys matching the prefix.
+     * Iterates the tracking Set of table names and deletes each index key
+     * as a logical key so the Redis client applies its prefix exactly once.
+     * SCAN cannot be used here: it returns raw (already-prefixed) keys, which
+     * the client would prefix again on DEL, producing double-prefixed names
+     * that never match.
      *
      * @return void
      */
     private function clearAllTableIndexes(): void
     {
         try {
-            // Use SCAN to find all table index keys (AWS/Valkey compatible)
-            $cursor = '0';
-            $pattern = $this->tableIndexPrefix . '*';
-            $keysToDelete = [];
+            $tables = $this->redis->smembers($this->tablesSet);
 
-            do {
-                $result = $this->redis->scan($cursor, ['match' => $pattern, 'count' => 100]);
-
-                if ($result === false) {
-                    break;
-                }
-
-                $cursor = $result[0];
-                $foundKeys = $result[1] ?? [];
-
-                if (!empty($foundKeys)) {
-                    $keysToDelete = array_merge($keysToDelete, $foundKeys);
-                }
-            } while ($cursor !== '0');
-
-            // Delete all found table index keys
-            if (!empty($keysToDelete)) {
-                $this->redis->del(...$keysToDelete);
+            if (empty($tables)) {
+                return;
             }
+
+            $this->redis->pipeline(function ($pipe) use ($tables) {
+                foreach ($tables as $table) {
+                    $pipe->del($this->tableIndexPrefix . $table);
+                }
+                $pipe->del($this->tablesSet);
+            });
         } catch (\Exception $e) {
             if ($this->config['log_enabled']) {
                 Log::warning('Query Cache (Redis): Failed to clear table indexes', [
