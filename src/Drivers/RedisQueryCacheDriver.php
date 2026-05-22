@@ -242,19 +242,23 @@ class RedisQueryCacheDriver implements QueryCacheDriver
 
         try {
             $fullKey = $this->buildFullKey($key);
+            $serialized = $this->serializeResult($result);
+            $tablesJson = json_encode($tables);
 
-            // Store as Redis Hash using HMSET
-            $this->redis->hmset($fullKey, [
-                'result' => $this->serializeResult($result),
-                'query' => $query,
-                'executed_at' => (string)$executedAt,
-                'cached_at' => (string)$now,
-                'hits' => '0',
-                'tables' => json_encode($tables),
-            ]);
-
-            // Set TTL
-            $this->redis->expire($fullKey, $ttl);
+            // Atomic write via MULTI/EXEC — guarantees both HMSET and EXPIRE
+            // either both commit or both roll back. A network blip between the
+            // two commands previously left keys without TTL (persistent forever).
+            $this->redis->transaction(function ($tx) use ($fullKey, $serialized, $query, $executedAt, $now, $tablesJson, $ttl) {
+                $tx->hmset($fullKey, [
+                    'result' => $serialized,
+                    'query' => $query,
+                    'executed_at' => (string)$executedAt,
+                    'cached_at' => (string)$now,
+                    'hits' => '0',
+                    'tables' => $tablesJson,
+                ]);
+                $tx->expire($fullKey, $ttl);
+            });
 
             // Track this key in our Set for efficient listing (AWS/Valkey compatible)
             $this->addKeyToSet($key);
@@ -428,9 +432,15 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             // Update last_accessed timestamp
             $this->redis->hset($fullKey, 'last_accessed', (string)$now);
 
-            // Refresh TTL
-            $ttl = $this->config['ttl'];
-            $this->redis->expire($fullKey, $ttl);
+            // TTL is intentionally not refreshed here: it represents the maximum
+            // acceptable staleness since put(), not an idle timeout. Refreshing
+            // on every hit caused frequently-read keys to never expire and
+            // serve stale data indefinitely.
+        } catch (\RedisException $e) {
+            Log::error('Query Cache (Redis): Connection/timeout error on recordHit', [
+                'key' => $key,
+                'error' => $e->getMessage()
+            ]);
         } catch (\Exception $e) {
             if ($this->config['log_enabled']) {
                 Log::warning('Query Cache (Redis): Failed to record hit', [

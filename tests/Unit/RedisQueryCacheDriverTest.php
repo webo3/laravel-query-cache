@@ -252,29 +252,58 @@ class RedisQueryCacheDriverTest extends TestCase
     }
 
     #[Test]
-    public function it_preserves_ttl_on_record_hit()
+    public function it_does_not_refresh_ttl_on_record_hit()
     {
-        $key = 'test_ttl_' . time();
+        // TTL must be absolute from put() time — refreshing on every hit
+        // caused frequently-accessed keys to live forever and serve stale data.
+        // Use a short TTL so the test can observe an actual decrement.
+        $shortTtlDriver = new RedisQueryCacheDriver([
+            'ttl' => 10,
+            'log_enabled' => false,
+            'redis_connection' => 'db_cache',
+        ]);
+
+        $key = 'test_ttl_absolute_' . time();
         $result = ['data'];
         $query = 'SELECT 1';
         $executedAt = microtime(true);
 
-        $this->driver->put($key, $result, $query, $executedAt);
+        $shortTtlDriver->put($key, $result, $query, $executedAt);
 
-        // Get initial TTL
         $fullKey = $this->buildFullKey($key);
         $ttlBefore = $this->redis->ttl($fullKey);
 
-        // Wait a bit
-        usleep(100000); // 0.1 seconds
+        // Wait long enough that TTL must have decremented at least 1s
+        sleep(2);
 
-        // Record hit should refresh TTL
-        $this->driver->recordHit($key);
+        $shortTtlDriver->recordHit($key);
 
         $ttlAfter = $this->redis->ttl($fullKey);
 
-        // TTL should be refreshed (close to original TTL)
-        $this->assertGreaterThan($ttlBefore - 5, $ttlAfter);
+        // recordHit() must not bump the TTL back up
+        $this->assertLessThan($ttlBefore, $ttlAfter, 'recordHit() must not refresh TTL');
+        $this->assertGreaterThan(0, $ttlAfter, 'Key should still be alive');
+
+        $shortTtlDriver->flush();
+    }
+
+    #[Test]
+    public function put_writes_hash_and_ttl_atomically()
+    {
+        $key = 'test_atomic_put_' . time();
+        $result = ['data'];
+        $query = 'SELECT * FROM users';
+        $executedAt = microtime(true);
+
+        $this->driver->put($key, $result, $query, $executedAt);
+
+        $fullKey = $this->buildFullKey($key);
+
+        // After put() the key must always have a TTL — never -1 (persistent).
+        // MULTI/EXEC guarantees HMSET and EXPIRE land together or not at all.
+        $ttl = $this->redis->ttl($fullKey);
+        $this->assertGreaterThan(0, $ttl, 'Key written by put() must have a TTL set');
+        $this->assertNotEquals(-1, $ttl, 'Key must not be persistent (no TTL)');
     }
 
     #[Test]
