@@ -8,30 +8,46 @@ namespace webO3\LaravelDbCache\Utils;
 class SqlTableExtractor
 {
     /**
-     * Matches a SQL keyword that introduces a table reference, then captures
-     * the full table list (supports schema-qualified names and comma lists).
+     * Keywords that introduce a table reference. Possessive quantifiers prevent
+     * backtracking on the JOIN-modifier prefix (matches NATURAL?, INNER, CROSS,
+     * or {LEFT|RIGHT|FULL} with optional OUTER).
      */
-    private const PATTERN = '/(?:'
-        . 'FROM'
-        . '|(?:(?:NATURAL|LEFT|RIGHT|FULL|INNER|OUTER|CROSS)\s+){0,3}JOIN'
+    private const KEYWORD = '(?:FROM'
+        . '|(?:NATURAL\s++)?+(?:(?:LEFT|RIGHT|FULL)(?:\s++OUTER)?+\s++|INNER\s++|CROSS\s++)?+JOIN'
         . '|STRAIGHT_JOIN'
         . '|UPDATE'
-        . '|(?:INSERT|REPLACE)\s+INTO'
-        . '|DELETE\s+FROM'
-        . '|TRUNCATE(?:\s+TABLE)?'
-        . '|ALTER\s+TABLE'
-        . '|DROP\s+TABLE(?:\s+IF\s+EXISTS)?'
-        . '|RENAME\s+TABLE'
-        . ')\s+('
-        . '(?:[`"\[]?[a-zA-Z0-9_]+[`"\]]?\s*\.\s*)?[`"\[]?[a-zA-Z0-9_]+[`"\]]?'
-        . '(?:\s*,\s*(?:[`"\[]?[a-zA-Z0-9_]+[`"\]]?\s*\.\s*)?[`"\[]?[a-zA-Z0-9_]+[`"\]]?)*'
-        . ')/i';
+        . '|(?:INSERT|REPLACE)\s++INTO'
+        . '|DELETE\s++FROM'
+        . '|TRUNCATE(?:\s++TABLE)?+'
+        . '|ALTER\s++TABLE'
+        . '|DROP\s++TABLE(?:\s++IF\s++EXISTS)?+'
+        . '|RENAME\s++TABLE'
+        . ')\s++';
 
     /**
-     * Extracts the trailing identifier from an optionally schema-qualified reference
-     * (e.g. `mydb.users` -> `users`, `"schema"."users"` -> `users`).
+     * Fast path (no comma in the SQL): one keyword introduces one table reference.
+     * Captures the trailing identifier directly, ignoring an optional schema prefix
+     * and surrounding quotes.
      */
-    private const TABLE_REF_PATTERN = '/(?:[`"\[]?[a-zA-Z0-9_]+[`"\]]?\s*\.\s*)?[`"\[]?([a-zA-Z0-9_]+)[`"\]]?/';
+    private const SINGLE_REF_PATTERN = '~' . self::KEYWORD
+        . '(?:["`\[]?+\w++["`\]]?+\s*+\.\s*+)?+'
+        . '["`\[]?+(\w++)["`\]]?+'
+        . '~i';
+
+    /**
+     * Slow path (the SQL contains a comma): captures the whole table list after
+     * each keyword as a single group; the list is split and normalized in PHP,
+     * which is cheaper than per-segment regex calls. Kept distinct from
+     * SINGLE_REF_PATTERN because adding the comma-list repetition to the fast
+     * path measurably defeats PCRE's first-byte scan optimization.
+     */
+    private const LIST_PATTERN = '~' . self::KEYWORD
+        . '('
+        . '(?:["`\[]?+\w++["`\]]?+\s*+\.\s*+)?+["`\[]?+\w++["`\]]?+'
+        . '(?:\s*+,\s*+(?:["`\[]?+\w++["`\]]?+\s*+\.\s*+)?+["`\[]?+\w++["`\]]?+)*+'
+        . ')~i';
+
+    private const STRIP_CHARS = " \t\n\r`\"[]";
 
     /**
      * Pattern to extract all table pairs from RENAME TABLE statements.
@@ -65,13 +81,38 @@ class SqlTableExtractor
             return self::$cache[$sql];
         }
 
-        preg_match_all(self::PATTERN, $sql, $matches);
+        // Decide whether the comma-list pattern is actually needed. The fast
+        // single-ref pattern can be used when:
+        //   - there is no comma at all, OR
+        //   - the first `(` precedes the first `,` (the comma is inside a
+        //     column/value list or CTE body, never a table list), OR
+        //   - the first `,` precedes any `FROM` keyword (it's in the SELECT
+        //     column list, e.g. `SELECT a, b FROM t`).
+        // Each check is a plain strpos/stripos — cheaper than the slow path's
+        // regex repetition for the common case.
+        $useListPath = false;
+        $commaPos = strpos($sql, ',');
+        if ($commaPos !== false) {
+            $parenPos = strpos($sql, '(');
+            if ($parenPos === false || $parenPos > $commaPos) {
+                $fromPos = stripos($sql, 'FROM');
+                $useListPath = $fromPos === false || $commaPos > $fromPos;
+            }
+        }
 
-        $tables = [];
-        foreach ($matches[1] as $tableList) {
-            foreach (explode(',', $tableList) as $tableRef) {
-                if (preg_match(self::TABLE_REF_PATTERN, $tableRef, $m)) {
-                    $tables[] = $m[1];
+        if (!$useListPath) {
+            preg_match_all(self::SINGLE_REF_PATTERN, $sql, $matches);
+            $tables = $matches[1];
+        } else {
+            preg_match_all(self::LIST_PATTERN, $sql, $matches);
+            $tables = [];
+            foreach ($matches[1] as $list) {
+                if (strpos($list, ',') === false) {
+                    $tables[] = self::normalizeRef($list);
+                } else {
+                    foreach (explode(',', $list) as $ref) {
+                        $tables[] = self::normalizeRef($ref);
+                    }
                 }
             }
         }
@@ -102,5 +143,19 @@ class SqlTableExtractor
     public static function resetCache(): void
     {
         self::$cache = [];
+    }
+
+    /**
+     * Strip surrounding whitespace/quotes from a table reference and discard
+     * an optional schema qualifier (`schema.table` -> `table`).
+     */
+    private static function normalizeRef(string $ref): string
+    {
+        $ref = trim($ref, self::STRIP_CHARS);
+        $dot = strpos($ref, '.');
+        if ($dot !== false) {
+            $ref = trim(substr($ref, $dot + 1), self::STRIP_CHARS);
+        }
+        return $ref;
     }
 }
