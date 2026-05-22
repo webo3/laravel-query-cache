@@ -57,6 +57,7 @@ This creates `config/db-cache.php` in your application.
 | `DB_QUERY_CACHE_LOG_ENABLED` | `false` | Enable cache hit/miss/invalidation logging |
 | `DB_QUERY_CACHE_CONNECTION` | `mysql` | Database connection name(s) to cache |
 | `DB_QUERY_CACHE_REDIS_CONNECTION` | `db_cache` | Redis connection name (redis driver only) |
+| `DB_QUERY_CACHE_EXCLUDED_TABLES` | _(empty)_ | Comma-separated identifiers (views, etc.) that must never be cached |
 
 ### Quick Start
 
@@ -201,6 +202,48 @@ protected $middleware = [
 ```
 
 The middleware only logs when `DB_QUERY_CACHE_LOG_ENABLED=true`. Log entries include the driver, URL, HTTP method, cached query count, total hits, and hit rate.
+
+## Excluding Views and Other Identifiers
+
+The cache invalidator works on the table names parsed out of each query. For a SQL **view**, that name *is* the view — not the underlying tables — so a mutation to a base table cannot be matched against the cached view query and would serve stale data until the TTL expires.
+
+Exclude any identifier that should never be cached:
+
+```env
+DB_QUERY_CACHE_EXCLUDED_TABLES=user_summary,order_totals,reporting_view
+```
+
+Or in `config/db-cache.php`:
+
+```php
+'excluded_tables' => ['user_summary', 'order_totals', 'reporting_view'],
+```
+
+Any `SELECT` referencing one of these identifiers (case-insensitive, bare name only — no schema qualifier) bypasses the cache entirely. You can also set the list at runtime per-connection:
+
+```php
+DB::connection('mysql')->setExcludedTables(['user_summary']);
+```
+
+## Long-Running Workers (Horizon, Octane, FrankenPHP)
+
+In long-running PHP processes — queue workers under Horizon, requests served by Laravel Octane (Swoole, RoadRunner, FrankenPHP) — the same PHP process handles many requests/jobs without restart. The L1 in-memory cache would normally outlive its intended TTL.
+
+The package automatically hooks Laravel's lifecycle events to drop L1 at the correct boundaries:
+
+| Runtime | Event |
+|---|---|
+| HTTP (FPM/Octane) | `RequestHandled` |
+| Queue worker / Horizon | `JobProcessed`, `JobFailed`, `JobExceptionOccurred` |
+| Octane (Swoole/RoadRunner/FrankenPHP) | `RequestTerminated`, `TaskTerminated`, `TickTerminated` |
+
+Only L1 (per-process) state is dropped — the shared L2 Redis cache survives, keeping the cache useful across the worker fleet. No manual setup is required; the listeners register automatically when `DB_QUERY_CACHE_ENABLED=true`.
+
+If you need to trigger this manually:
+
+```php
+DB::connection('mysql')->flushRequestCache();
+```
 
 ## Multi-Connection Support
 

@@ -20,4 +20,8 @@ interface CachedConnection
     public function disableQueryCache(): void;
 
     public function setTenantContext(string $tenantId): void;
+
+    public function flushRequestCache(): void;
+
+    public function setExcludedTables(array $tables): void;
 }

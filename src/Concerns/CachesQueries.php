@@ -99,6 +99,14 @@ trait CachesQueries
                 return parent::run($query, $bindings, $callback);
             }
 
+            // Never cache SELECTs touching excluded identifiers (typically
+            // views): the extractor sees the view name, not its underlying
+            // tables, so we cannot reliably invalidate when a base table
+            // mutates.
+            if ($this->touchesExcludedTable($query)) {
+                return parent::run($query, $bindings, $callback);
+            }
+
             return $this->runSelectWithCache($query, $bindings, $callback);
         }
 
@@ -109,6 +117,29 @@ trait CachesQueries
 
         // Execute the query normally
         return parent::run($query, $bindings, $callback);
+    }
+
+    /**
+     * Check if the query references any identifier marked as excluded
+     * (typically a view). Match is case-insensitive on the bare name.
+     */
+    private function touchesExcludedTable(string $query): bool
+    {
+        $excluded = $this->config['db_cache']['excluded_tables'] ?? [];
+
+        if (empty($excluded)) {
+            return false;
+        }
+
+        $excludedLower = array_map('strtolower', $excluded);
+
+        foreach (SqlTableExtractor::extract($query) as $table) {
+            if (in_array(strtolower($table), $excludedLower, true)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -352,6 +383,20 @@ trait CachesQueries
     }
 
     /**
+     * Flush per-request state at request/job/Octane request boundaries.
+     *
+     * Drops the driver's L1 cache and resets process-static caches in
+     * this trait so long-running workers (Horizon, FrankenPHP) don't
+     * accumulate stale entries that outlive their intended TTL. Does
+     * NOT touch the shared L2 (Redis) cache.
+     */
+    public function flushRequestCache(): void
+    {
+        $this->cacheDriver->flushRequestCache();
+        self::$normalizedQueryCache = [];
+    }
+
+    /**
      * Get cache statistics
      *
      * @return array
@@ -375,5 +420,14 @@ trait CachesQueries
     public function disableQueryCache(): void
     {
         $this->config['db_cache']['enabled'] = false;
+    }
+
+    /**
+     * Replace the list of excluded identifiers at runtime.
+     * Useful when view names are discovered after boot.
+     */
+    public function setExcludedTables(array $tables): void
+    {
+        $this->config['db_cache']['excluded_tables'] = $tables;
     }
 }

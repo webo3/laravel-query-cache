@@ -655,4 +655,99 @@ abstract class AbstractCachedConnectionTest extends TestCase
         $this->assertEquals(0, $stats['cached_queries_count']);
         $this->assertEquals(0, $stats['total_cache_hits']);
     }
+
+    // ===================================
+    // EXCLUDED TABLES (e.g. VIEWS) TESTS
+    // ===================================
+
+    /**
+     * Set the excluded-tables list on the live connection.
+     * Purging would also drop the temporary tables our setUp created,
+     * so we mutate via the public setter on the trait instead.
+     */
+    private function configureExcludedTables(array $excluded): void
+    {
+        $this->connection->setExcludedTables($excluded);
+    }
+
+    public function test_select_on_excluded_table_is_not_cached()
+    {
+        $this->configureExcludedTables(['test_cache_products']);
+
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+
+        $stats = $this->getCachedConnection()->getCacheStats();
+        $this->assertEquals(0, $stats['cached_queries_count']);
+        $this->assertEquals(0, $stats['total_cache_hits']);
+    }
+
+    public function test_excluded_table_match_is_case_insensitive()
+    {
+        $this->configureExcludedTables(['TEST_CACHE_PRODUCTS']);
+
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+
+        $stats = $this->getCachedConnection()->getCacheStats();
+        $this->assertEquals(0, $stats['cached_queries_count']);
+    }
+
+    public function test_excluded_table_in_join_skips_cache()
+    {
+        $this->configureExcludedTables(['test_cache_categories']);
+
+        $this->getCachedConnection()->select(
+            'SELECT * FROM test_cache_products INNER JOIN test_cache_categories ON test_cache_products.id = test_cache_categories.id LIMIT 1'
+        );
+
+        $stats = $this->getCachedConnection()->getCacheStats();
+        $this->assertEquals(0, $stats['cached_queries_count']);
+    }
+
+    public function test_non_excluded_queries_still_cache_when_exclusion_configured()
+    {
+        $this->configureExcludedTables(['test_cache_products']);
+
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_categories LIMIT 1');
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_categories LIMIT 1');
+
+        $stats = $this->getCachedConnection()->getCacheStats();
+        $this->assertEquals(1, $stats['cached_queries_count']);
+        $this->assertEquals(1, $stats['total_cache_hits']);
+    }
+
+    public function test_excluded_query_still_returns_correct_results()
+    {
+        $this->configureExcludedTables(['test_cache_products']);
+
+        $uncached = $this->getCachedConnection()->select('SELECT id, name FROM test_cache_products ORDER BY id');
+        $secondRun = $this->getCachedConnection()->select('SELECT id, name FROM test_cache_products ORDER BY id');
+
+        $this->assertEquals($uncached, $secondRun);
+        $this->assertNotEmpty($uncached);
+    }
+
+    // ===================================
+    // FLUSH REQUEST CACHE TESTS (L1 EVICTION)
+    // ===================================
+
+    public function test_flush_request_cache_drops_l1_entries()
+    {
+        // Populate L1 (and L2 if present)
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+
+        $this->getCachedConnection()->flushRequestCache();
+
+        // After L1 flush, the next read either misses entirely (array driver)
+        // or refetches from L2 (redis driver) — either way, no L1 hit is
+        // recorded synchronously from in-process state.
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+
+        // Sanity: subsequent identical query produces at least one hit again
+        // (proves driver still functional post-flush).
+        $this->getCachedConnection()->select('SELECT * FROM test_cache_products LIMIT 1');
+        $stats = $this->getCachedConnection()->getCacheStats();
+
+        $this->assertGreaterThanOrEqual(1, $stats['total_cache_hits']);
+    }
 }

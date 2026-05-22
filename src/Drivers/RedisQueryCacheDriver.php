@@ -461,6 +461,15 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     }
 
     /**
+     * {@inheritDoc}
+     */
+    public function flushRequestCache(): void
+    {
+        $this->requestCache = [];
+        SqlTableExtractor::resetCache();
+    }
+
+    /**
      * Add a key to the tracking Set
      *
      * @param string $key

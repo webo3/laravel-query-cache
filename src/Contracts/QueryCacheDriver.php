@@ -87,4 +87,15 @@ interface QueryCacheDriver
      * @return void
      */
     public function setTenantContext(string $tenantId): void;
+
+    /**
+     * Flush request-scoped state (L1 cache, per-process static caches).
+     *
+     * Called at request / job / Octane request boundaries so that
+     * long-running workers (Horizon, FrankenPHP) don't accumulate L1
+     * entries that outlive their intended TTL. Does not touch L2 (Redis).
+     *
+     * @return void
+     */
+    public function flushRequestCache(): void;
 }

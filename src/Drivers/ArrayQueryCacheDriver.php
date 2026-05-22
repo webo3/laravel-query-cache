@@ -225,6 +225,19 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
     }
 
     /**
+     * {@inheritDoc}
+     *
+     * The array driver IS the L1 cache — flushing per-request state means
+     * dropping all cached entries and the inverted table index.
+     */
+    public function flushRequestCache(): void
+    {
+        self::$cache = [];
+        self::$tableIndex = [];
+        SqlTableExtractor::resetCache();
+    }
+
+    /**
      * Evict least recently used cache entries when cache size exceeds limit.
      *
      * LRU order is maintained by array insertion order: recordHit() moves

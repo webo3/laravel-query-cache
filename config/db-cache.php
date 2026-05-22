@@ -100,4 +100,27 @@ return [
 
     'redis_connection' => env('DB_QUERY_CACHE_REDIS_CONNECTION', 'db_cache'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Excluded Tables / Views
+    |--------------------------------------------------------------------------
+    |
+    | Identifiers (views, materialized views, or tables) that must NEVER be
+    | cached. A SELECT touching any of these names is executed and returned
+    | without caching, because we can't reliably invalidate it: a view's
+    | underlying tables are opaque to the SQL extractor, so updates to the
+    | base tables would not invalidate the cached view result.
+    |
+    | Match is case-insensitive on the bare identifier (no schema qualifier).
+    |
+    | Configure via env as a comma-separated list:
+    |   DB_QUERY_CACHE_EXCLUDED_TABLES=user_summary,order_totals
+    |
+    | Or as a PHP array:
+    |   'excluded_tables' => ['user_summary', 'order_totals'],
+    |
+    */
+
+    'excluded_tables' => env('DB_QUERY_CACHE_EXCLUDED_TABLES', []),
+
 ];

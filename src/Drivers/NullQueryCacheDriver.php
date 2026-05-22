@@ -96,4 +96,12 @@ class NullQueryCacheDriver implements QueryCacheDriver
     {
         // No-op
     }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function flushRequestCache(): void
+    {
+        // No-op
+    }
 }
