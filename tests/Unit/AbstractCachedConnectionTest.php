@@ -65,7 +65,11 @@ abstract class AbstractCachedConnectionTest extends TestCase
             "database.connections.{$conn}.db_cache.driver" => $this->getDriverName(),
             "database.connections.{$conn}.db_cache.ttl" => 300,
             "database.connections.{$conn}.db_cache.max_size" => 1000,
-            "database.connections.{$conn}.db_cache.log_enabled" => false,
+            // Hit statistics (total_cache_hits) are only recorded when stats
+            // logging is enabled — these tests assert on hit counts, so they
+            // must opt in. The Redis driver skips recordHit() entirely when
+            // this is false to avoid per-hit overhead and zombie-key resurrection.
+            "database.connections.{$conn}.db_cache.log_enabled" => true,
         ]);
 
         // Purge existing connection to force reconnection with new config

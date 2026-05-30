@@ -189,7 +189,13 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             $fullKey = $this->buildFullKey($key);
             $data = $this->redis->hgetall($fullKey);
 
-            if (empty($data)) {
+            // Treat a hash that exists but has no 'result' field as a miss.
+            // recordHit()'s HINCRBY can resurrect a just-expired key into a
+            // TTL-less hash holding only {hits, last_accessed} and no 'result'.
+            // Returning it would hand the caller ['result' => null] — a wrong,
+            // sticky null. Missing instead makes the query re-run and put()
+            // rewrite a complete entry with a fresh TTL (self-healing).
+            if (empty($data) || !isset($data['result'])) {
                 return null;
             }
 
@@ -428,6 +434,17 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     public function recordHit(string $key): void
     {
+        // The hits / last_accessed fields exist only to feed getStats(), which
+        // is read solely by the stats middleware when log_enabled is set. With
+        // stats off (the default) skip the two Redis round-trips entirely: they
+        // add latency to every cache hit and are the only path by which a
+        // just-expired key gets resurrected (via HINCRBY) into a TTL-less,
+        // result-less hash. get() guards against such zombies, but not
+        // creating them in the first place is cheaper and cleaner.
+        if (!$this->config['log_enabled']) {
+            return;
+        }
+
         // Invalidate L1 cache so next get() fetches updated hits from Redis
         unset($this->requestCache[$key]);
 

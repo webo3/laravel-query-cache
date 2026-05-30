@@ -109,26 +109,35 @@ class RedisQueryCacheDriverTest extends TestCase
     #[Test]
     public function it_uses_hincrby_for_atomic_hit_counting()
     {
+        // Hit counting only runs when stats logging is enabled.
+        $driver = new RedisQueryCacheDriver([
+            'ttl' => 300,
+            'log_enabled' => true,
+            'redis_connection' => 'db_cache',
+        ]);
+
         $key = 'test_hincrby_' . time();
         $result = ['item'];
         $query = 'SELECT * FROM items';
         $executedAt = microtime(true);
 
-        $this->driver->put($key, $result, $query, $executedAt);
+        $driver->put($key, $result, $query, $executedAt);
 
         // Record multiple hits
-        $this->driver->recordHit($key);
-        $this->driver->recordHit($key);
-        $this->driver->recordHit($key);
+        $driver->recordHit($key);
+        $driver->recordHit($key);
+        $driver->recordHit($key);
 
         // Verify hits were incremented atomically
-        $cached = $this->driver->get($key);
+        $cached = $driver->get($key);
         $this->assertEquals(3, $cached['hits']);
 
         // Verify using direct Redis HGET
         $fullKey = $this->buildFullKey($key);
         $hitsFromRedis = (int)$this->redis->hget($fullKey, 'hits');
         $this->assertEquals(3, $hitsFromRedis);
+
+        $driver->flush();
     }
 
     #[Test]
@@ -257,9 +266,12 @@ class RedisQueryCacheDriverTest extends TestCase
         // TTL must be absolute from put() time — refreshing on every hit
         // caused frequently-accessed keys to live forever and serve stale data.
         // Use a short TTL so the test can observe an actual decrement.
+        // log_enabled so recordHit() actually touches Redis — otherwise the
+        // no-refresh assertion below would pass vacuously (recordHit is a no-op
+        // when stats are disabled).
         $shortTtlDriver = new RedisQueryCacheDriver([
             'ttl' => 10,
-            'log_enabled' => false,
+            'log_enabled' => true,
             'redis_connection' => 'db_cache',
         ]);
 
@@ -304,6 +316,79 @@ class RedisQueryCacheDriverTest extends TestCase
         $ttl = $this->redis->ttl($fullKey);
         $this->assertGreaterThan(0, $ttl, 'Key written by put() must have a TTL set');
         $this->assertNotEquals(-1, $ttl, 'Key must not be persistent (no TTL)');
+    }
+
+    #[Test]
+    public function it_does_not_record_hits_when_stats_disabled()
+    {
+        // Default driver has log_enabled = false (see setUp()).
+        $key = 'test_no_stats_' . time();
+        $this->driver->put($key, ['x'], 'SELECT * FROM t', microtime(true));
+
+        $this->driver->recordHit($key);
+        $this->driver->recordHit($key);
+
+        // hits exists only to feed stats logging; when that's off we skip the
+        // HINCRBY entirely, so the counter stays at its put()-time value.
+        $cached = $this->driver->get($key);
+        $this->assertEquals(0, $cached['hits']);
+    }
+
+    #[Test]
+    public function record_hit_does_not_resurrect_an_absent_key_when_stats_disabled()
+    {
+        // The whole point of gating recordHit(): with stats off it must never
+        // touch Redis, so a key that has expired (or never existed) cannot be
+        // resurrected by HINCRBY into a TTL-less, result-less zombie.
+        $key = 'test_no_resurrect_' . time();
+        $fullKey = $this->buildFullKey($key);
+
+        $this->driver->recordHit($key);
+
+        $this->assertEquals(0, $this->redis->exists($fullKey), 'recordHit() must not create a key when stats are disabled');
+    }
+
+    #[Test]
+    public function get_treats_a_resultless_zombie_hash_as_a_miss()
+    {
+        // Simulate a resurrected key: a hash holding only {hits} and no
+        // 'result' field, exactly what HINCRBY produces on an expired key.
+        $key = 'test_zombie_' . time();
+        $fullKey = $this->buildFullKey($key);
+        $this->redis->hincrby($fullKey, 'hits', 1);
+
+        // Without the guard, get() would return ['result' => null, ...] and the
+        // caller would receive a sticky null. It must be treated as a miss.
+        $this->assertNull($this->driver->get($key), 'A hash with no result field must be a cache miss');
+    }
+
+    #[Test]
+    public function a_resurrected_key_is_neutralized_by_get_even_with_stats_enabled()
+    {
+        // End-to-end race: stats on, key expires between get() and recordHit(),
+        // recordHit() resurrects a result-less zombie. The get() guard must
+        // still treat the next read as a miss so the caller never sees null.
+        $driver = new RedisQueryCacheDriver([
+            'ttl' => 300,
+            'log_enabled' => true,
+            'redis_connection' => 'db_cache',
+        ]);
+
+        $key = 'test_race_heal_' . time();
+        $fullKey = $this->buildFullKey($key);
+
+        $driver->put($key, ['real'], 'SELECT * FROM t', microtime(true));
+
+        // Mimic the key expiring after get() read it but before recordHit().
+        $this->redis->del($fullKey);
+        $driver->recordHit($key); // resurrects {hits, last_accessed}, no result
+
+        // The zombie exists in Redis...
+        $this->assertEquals(1, $this->redis->exists($fullKey));
+        // ...but get() must report a miss, not hand back result => null.
+        $this->assertNull($driver->get($key));
+
+        $driver->flush();
     }
 
     #[Test]
