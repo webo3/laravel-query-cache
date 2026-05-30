@@ -32,6 +32,12 @@ trait CachesQueries
     private bool $inCursorQuery = false;
 
     /**
+     * Whether a tenant context has been set on this connection. Used by the
+     * `tenant_required` fail-safe to bypass caching until the context exists.
+     */
+    private bool $tenantContextSet = false;
+
+    /**
      * Per-request cache for normalized queries to avoid redundant normalization
      */
     private static array $normalizedQueryCache = [];
@@ -90,12 +96,26 @@ trait CachesQueries
             return parent::run($query, $bindings, $callback);
         }
 
-        $queryType = $this->getQueryType($query);
+        $queryType = $this->classifyQuery($query);
 
         // Handle SELECT queries with caching
         if ($queryType === 'SELECT') {
-            // Never cache queries against system/metadata tables
+            // Inside an open transaction a SELECT can observe this connection's
+            // own uncommitted writes; caching them would leak dirty reads that
+            // survive a rollback. Bypass caching until the transaction resolves.
+            if ($this->transactionLevel() > 0) {
+                return parent::run($query, $bindings, $callback);
+            }
+
+            // Never cache queries against system/metadata tables.
             if ($this->isSchemaQuery($query)) {
+                return parent::run($query, $bindings, $callback);
+            }
+
+            // Never cache locking reads (FOR UPDATE / FOR SHARE / LOCK IN SHARE
+            // MODE): a cache hit would skip the row lock the statement exists to
+            // acquire and could return stale rows.
+            if ($this->isLockingRead($query)) {
                 return parent::run($query, $bindings, $callback);
             }
 
@@ -110,9 +130,15 @@ trait CachesQueries
             return $this->runSelectWithCache($query, $bindings, $callback);
         }
 
-        // Handle mutation queries (INSERT, UPDATE, DELETE, etc.)
-        if ($this->isMutationQuery($query)) {
-            $this->invalidateCache($query);
+        // Handle mutation queries (INSERT, UPDATE, DELETE, CTE-wrapped DML, ...)
+        if ($queryType === 'MUTATION') {
+            // Run the write FIRST, then invalidate, so a concurrent reader can
+            // only re-cache the post-write state. scheduleInvalidation() defers
+            // to the commit boundary when inside a transaction.
+            $result = parent::run($query, $bindings, $callback);
+            $this->scheduleInvalidation($query);
+
+            return $result;
         }
 
         // Execute the query normally
@@ -197,14 +223,17 @@ trait CachesQueries
     private function generateCacheKey(string $query, array $bindings): string
     {
         $normalizedQuery = $this->normalizeQuery($query);
-        $raw = $normalizedQuery . json_encode($bindings);
 
-        // Use xxh128 (PHP 8.1+) for ~5-10x faster hashing than md5
-        if (function_exists('hash')) {
-            return hash('xxh128', $raw);
-        }
+        // Namespace the key by connection so identical SQL + bindings against a
+        // different database/connection can never collide. Bindings are encoded
+        // with serialize() (not json_encode): it is binary-safe and
+        // type-preserving, so binary/non-UTF-8 or differently-typed parameter
+        // values yield distinct keys. json_encode returns false for invalid
+        // UTF-8, which would collapse the bindings and alias unrelated queries.
+        $raw = $this->getName() . "\0" . $normalizedQuery . "\0" . serialize($bindings);
 
-        return md5($raw);
+        // xxh128 (PHP 8.1+) — ~5-10x faster than md5.
+        return hash('xxh128', $raw);
     }
 
     /**
@@ -220,48 +249,194 @@ trait CachesQueries
             return self::$normalizedQueryCache[$query];
         }
 
-        $normalized = preg_replace('/\s+/', ' ', strtoupper(trim($query)));
-
-        self::$normalizedQueryCache[$query] = $normalized;
-
-        return $normalized;
+        return self::$normalizedQueryCache[$query] = $this->normalizeStructure($query);
     }
 
     /**
-     * Extract query type from SQL
+     * Upper-case keywords/identifiers and collapse runs of whitespace, but
+     * leave the contents of quoted string literals and quoted identifiers
+     * untouched. This keeps caching case-/whitespace-insensitive for the query
+     * structure while ensuring two raw queries that differ only by a literal's
+     * case or internal spacing (e.g. 'Active' vs 'ACTIVE') hash to different
+     * keys instead of colliding.
      *
      * @param string $sql
      * @return string
      */
-    private function getQueryType(string $sql): string
+    private function normalizeStructure(string $sql): string
     {
-        if (preg_match('/^\s*(SELECT|INSERT|UPDATE|DELETE|TRUNCATE|REPLACE|ALTER|DROP|CREATE|RENAME|SHOW|DESCRIBE|EXPLAIN)\b/i', trim($sql), $matches)) {
-            return strtoupper($matches[1]);
+        $out = '';
+        $len = strlen($sql);
+        $quote = null;       // active quote char (' " `) or null
+        $pendingSpace = false;
+
+        for ($i = 0; $i < $len; $i++) {
+            $ch = $sql[$i];
+
+            if ($quote !== null) {
+                $out .= $ch;
+                if ($ch === '\\' && $quote !== '`' && $i + 1 < $len) {
+                    // Backslash escape inside a string literal: copy next char verbatim.
+                    $out .= $sql[++$i];
+                } elseif ($ch === $quote) {
+                    if ($i + 1 < $len && $sql[$i + 1] === $quote) {
+                        // Doubled quote = escaped quote, still inside the literal.
+                        $out .= $sql[++$i];
+                    } else {
+                        $quote = null;
+                    }
+                }
+                continue;
+            }
+
+            if ($ch === "'" || $ch === '"' || $ch === '`') {
+                if ($pendingSpace && $out !== '') {
+                    $out .= ' ';
+                }
+                $pendingSpace = false;
+                $quote = $ch;
+                $out .= $ch;
+                continue;
+            }
+
+            if ($ch === ' ' || $ch === "\t" || $ch === "\n" || $ch === "\r" || $ch === "\f" || $ch === "\v") {
+                $pendingSpace = true;
+                continue;
+            }
+
+            if ($pendingSpace && $out !== '') {
+                $out .= ' ';
+            }
+            $pendingSpace = false;
+            $out .= strtoupper($ch);
         }
 
-        return 'UNKNOWN';
+        return $out;
     }
 
     /**
-     * Check if query is a mutation
+     * Classify a SQL statement for caching purposes.
+     *
+     * Returns 'SELECT' (a cacheable read, including read-only CTEs),
+     * 'MUTATION' (a write whose effect must invalidate the cache), or 'OTHER'
+     * (SHOW / DESCRIBE / EXPLAIN / PRAGMA / ...). Leading comments are stripped
+     * first so an instrumented query whose verb is preceded by a comment is
+     * still recognised.
+     *
+     * @param string $sql
+     * @return string
+     */
+    private function classifyQuery(string $sql): string
+    {
+        $sql = $this->stripLeadingComments($sql);
+
+        if (preg_match('/^\s*SELECT\b/i', $sql)) {
+            return 'SELECT';
+        }
+
+        if (preg_match('/^\s*(INSERT|UPDATE|DELETE|TRUNCATE|REPLACE|ALTER|DROP|CREATE|RENAME|MERGE|CALL|EXEC|EXECUTE)\b/i', $sql)) {
+            return 'MUTATION';
+        }
+
+        // Common Table Expressions: classify by the statement they wrap. A
+        // data-modifying CTE (Postgres) or a top-level UPDATE/DELETE/INSERT
+        // after the CTE list (MySQL) is a mutation; a plain WITH ... SELECT is
+        // a cacheable read (SqlTableExtractor strips the CTE aliases).
+        if (preg_match('/^\s*WITH\b/i', $sql)) {
+            if (preg_match('/\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|REPLACE\s+INTO)\b/i', $sql)) {
+                return 'MUTATION';
+            }
+
+            return 'SELECT';
+        }
+
+        return 'OTHER';
+    }
+
+    /**
+     * Strip leading line ("-- ..."), hash ("# ...") and C-style block comments
+     * plus surrounding whitespace so the leading keyword can be read.
+     *
+     * @param string $sql
+     * @return string
+     */
+    private function stripLeadingComments(string $sql): string
+    {
+        $sql = ltrim($sql);
+
+        while ($sql !== '') {
+            if (str_starts_with($sql, '/*')) {
+                $end = strpos($sql, '*/');
+                if ($end === false) {
+                    return ''; // unterminated comment — nothing classifiable
+                }
+                $sql = ltrim(substr($sql, $end + 2));
+                continue;
+            }
+
+            if (str_starts_with($sql, '--') || str_starts_with($sql, '#')) {
+                $nl = strpos($sql, "\n");
+                if ($nl === false) {
+                    return '';
+                }
+                $sql = ltrim(substr($sql, $nl + 1));
+                continue;
+            }
+
+            break;
+        }
+
+        return $sql;
+    }
+
+    /**
+     * Detect locking reads that must never be cached.
      *
      * @param string $sql
      * @return bool
      */
-    private function isMutationQuery(string $sql): bool
+    private function isLockingRead(string $sql): bool
     {
-        return preg_match('/^\s*(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|DROP|CREATE|RENAME|REPLACE)\b/i', trim($sql)) === 1;
+        return preg_match('/\bFOR\s+UPDATE\b|\bFOR\s+SHARE\b|\bFOR\s+NO\s+KEY\s+UPDATE\b|\bFOR\s+KEY\s+SHARE\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i', $sql) === 1;
     }
 
     /**
-     * Check if query targets system/metadata tables that should never be cached
+     * Invalidate the cache for a mutation, deferring to the commit boundary
+     * when inside a transaction so the purge can't be repopulated with
+     * pre-commit data and is discarded if the transaction rolls back.
+     *
+     * @param string $query
+     * @return void
+     */
+    private function scheduleInvalidation(string $query): void
+    {
+        if ($this->transactionLevel() > 0) {
+            try {
+                $this->afterCommit(fn () => $this->invalidateCache($query));
+
+                return;
+            } catch (\RuntimeException $e) {
+                // No transactions manager bound (e.g. a bare connection):
+                // fall back to immediate invalidation.
+            }
+        }
+
+        $this->invalidateCache($query);
+    }
+
+    /**
+     * Check if query targets system/metadata catalogs that should never be
+     * cached (they are not tracked for invalidation).
      *
      * @param string $sql
      * @return bool
      */
     private function isSchemaQuery(string $sql): bool
     {
-        return preg_match('/\binformation_schema\b/i', $sql) === 1;
+        return preg_match(
+            '/\b(information_schema|performance_schema|pg_catalog|pg_class|pg_attribute|pg_namespace|pg_index|sqlite_master|sqlite_schema|sqlite_temp_master)\b|\b(?:mysql|sys)\s*\.\s*\w/i',
+            $sql
+        ) === 1;
     }
 
     /**
@@ -295,6 +470,7 @@ trait CachesQueries
     public function setTenantContext(string $tenantId): void
     {
         $this->cacheDriver->setTenantContext($tenantId);
+        $this->tenantContextSet = true;
     }
 
     /**
@@ -304,7 +480,19 @@ trait CachesQueries
      */
     private function isCachingEnabled(): bool
     {
-        return (bool)($this->config['db_cache']['enabled'] ?? false);
+        if (!($this->config['db_cache']['enabled'] ?? false)) {
+            return false;
+        }
+
+        // Fail-safe multi-tenant guard: when tenant_required is on, bypass
+        // caching entirely until setTenantContext() has namespaced the keys,
+        // so a forgotten context degrades to "no caching" rather than leaking
+        // one tenant's cached rows to another.
+        if (($this->config['db_cache']['tenant_required'] ?? false) && !$this->tenantContextSet) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -320,7 +508,7 @@ trait CachesQueries
             Log::debug('Query Cache: HIT', [
                 'caller' => $this->getCallerInfo(),
                 'query' => $query,
-                'bindings' => $bindings
+                'bindings' => $this->redactBindings($bindings)
             ]);
         }
     }
@@ -338,9 +526,24 @@ trait CachesQueries
             Log::debug('Query Cache: MISS', [
                 'caller' => $this->getCallerInfo(),
                 'query' => $query,
-                'bindings' => $bindings
+                'bindings' => $this->redactBindings($bindings)
             ]);
         }
+    }
+
+    /**
+     * Redact binding values before logging. Raw bindings routinely contain PII,
+     * tokens or password hashes; log only the count and types for debugging.
+     *
+     * @param array $bindings
+     * @return array
+     */
+    private function redactBindings(array $bindings): array
+    {
+        return [
+            'count' => count($bindings),
+            'types' => array_map(fn ($b) => get_debug_type($b), array_values($bindings)),
+        ];
     }
 
     /**

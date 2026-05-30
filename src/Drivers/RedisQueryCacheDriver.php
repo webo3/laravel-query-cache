@@ -62,6 +62,26 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     private array $requestCache = [];
 
     /**
+     * Circuit breaker: timestamp (microtime) until which Redis is considered
+     * down and skipped, after a connection/timeout error. Prevents a Redis
+     * outage from turning every query into a per-call socket-timeout against a
+     * dead node (DB stampede) and flooding the log with one error per query.
+     */
+    private ?float $circuitOpenUntil = null;
+
+    /**
+     * Seconds to skip Redis after a connection/timeout error.
+     */
+    private const CIRCUIT_COOLDOWN_SECONDS = 5;
+
+    /**
+     * Cached data-key prefix ("{appSlug}_database_{cachePrefix}:"), computed
+     * once instead of resolving config + slugifying on every key build (which
+     * happened per-key inside the pipelined stats/delete loops).
+     */
+    private string $keyPrefix;
+
+    /**
      * Constructor
      */
     public function __construct(array $config = [])
@@ -71,6 +91,10 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'log_enabled' => false,
             'redis_connection' => 'db_cache',
         ], $config);
+
+        $appSlug = \Illuminate\Support\Str::slug(config('app.name', 'laravel'), '_');
+        $cachePrefix = config('cache.prefix');
+        $this->keyPrefix = "{$appSlug}_database_{$cachePrefix}:";
 
         // Get direct Redis connection
         $redisConnectionName = $this->config['redis_connection'];
@@ -103,75 +127,102 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     private function buildFullKey(string $key): string
     {
-        $appName = config('app.name', 'laravel');
-        $appSlug = \Illuminate\Support\Str::slug($appName, '_');
-        $cachePrefix = config('cache.prefix');
-
         if ($this->tenantId !== null) {
-            return "{$appSlug}_database_{$cachePrefix}:t:{$this->tenantId}:{$key}";
+            return "{$this->keyPrefix}t:{$this->tenantId}:{$key}";
         }
 
-        return "{$appSlug}_database_{$cachePrefix}:{$key}";
+        return "{$this->keyPrefix}{$key}";
     }
 
     /**
-     * Serialize result with best available method
+     * Uncompressed payload size (bytes) above which gzip is applied.
+     */
+    private const COMPRESS_THRESHOLD = 10240;
+
+    /**
+     * Serialize a result for storage.
      *
-     * Uses igbinary if available, with automatic compression for large results.
+     * Every payload carries an explicit 2-char format marker (IB/IZ/PS/PZ) so
+     * the reader decodes by marker instead of guessing — guessing broke when
+     * igbinary availability differed between the writer and a reader, and the
+     * old 'i:'/'c:' markers could fatally call an undefined function.
+     *
+     *   IB = igbinary, raw          IZ = igbinary + gzip
+     *   PS = php serialize, raw     PZ = php serialize + gzip
      */
     private function serializeResult(mixed $result): string
     {
-        // Use igbinary if available
         if (function_exists('igbinary_serialize')) {
             $serialized = \igbinary_serialize($result);
 
-            // Compress large results
-            if (strlen($serialized) > 10240) {
-                return 'i:' . \gzcompress($serialized, 6);
-            }
-
-            return $serialized;
+            return strlen($serialized) > self::COMPRESS_THRESHOLD
+                ? 'IZ' . \gzcompress($serialized, 6)
+                : 'IB' . $serialized;
         }
 
-        // Fallback to standard serialize
         $serialized = serialize($result);
 
-        if (strlen($serialized) > 10240) {
-            return 'c:' . \gzcompress($serialized, 6);
-        }
-
-        return $serialized;
+        return strlen($serialized) > self::COMPRESS_THRESHOLD
+            ? 'PZ' . \gzcompress($serialized, 6)
+            : 'PS' . $serialized;
     }
 
     /**
-     * Unserialize result with automatic format detection
+     * Decode a stored payload strictly by its format marker.
+     *
+     * Throws on any unreadable payload (unknown/legacy marker, missing igbinary
+     * extension, corrupt gzip, corrupt serialization) so the caller treats it
+     * as a cache miss and re-populates, rather than returning a wrong value or
+     * fatally erroring on an undefined function. PHP-serialize payloads are
+     * restricted to stdClass (query rows) to deny object-injection gadgets.
+     *
+     * @throws \RuntimeException
      */
     private function unserializeResult(string $data): mixed
     {
-        if (empty($data)) {
-            return null;
-        }
+        $marker = substr($data, 0, 2);
+        $payload = substr($data, 2);
 
-        // Check for compression markers
-        if (str_starts_with($data, 'i:')) {
-            // igbinary + gzcompress
-            $decompressed = \gzuncompress(substr($data, 2));
-            return \igbinary_unserialize($decompressed);
-        }
+        switch ($marker) {
+            case 'IB':
+            case 'IZ':
+                if (!function_exists('igbinary_unserialize')) {
+                    throw new \RuntimeException('Query Cache (Redis): igbinary extension unavailable for cached payload');
+                }
+                if ($marker === 'IZ') {
+                    $payload = $this->gunzip($payload);
+                }
+                return \igbinary_unserialize($payload);
 
-        if (str_starts_with($data, 'c:')) {
-            // serialize + gzcompress
-            $decompressed = \gzuncompress(substr($data, 2));
-            return unserialize($decompressed);
-        }
+            case 'PS':
+            case 'PZ':
+                if ($marker === 'PZ') {
+                    $payload = $this->gunzip($payload);
+                }
+                $value = @unserialize($payload, ['allowed_classes' => ['stdClass']]);
+                if ($value === false && $payload !== 'b:0;') {
+                    throw new \RuntimeException('Query Cache (Redis): corrupt serialized cache payload');
+                }
+                return $value;
 
-        // Try igbinary first (check if data starts with igbinary header)
-        if (function_exists('igbinary_unserialize') && ord($data[0]) === 0x00) {
-            return \igbinary_unserialize($data);
+            default:
+                // Unknown or legacy (pre-marker) format — treat as a miss.
+                throw new \RuntimeException('Query Cache (Redis): unknown cache payload format');
         }
+    }
 
-        // Fallback to standard unserialize
-        return unserialize($data);
+    /**
+     * gzuncompress with failure converted to an exception.
+     *
+     * @throws \RuntimeException
+     */
+    private function gunzip(string $data): string
+    {
+        $raw = @gzuncompress($data);
+        if ($raw === false) {
+            throw new \RuntimeException('Query Cache (Redis): corrupt compressed cache payload');
+        }
+        return $raw;
     }
 
     /**
@@ -184,24 +235,39 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             return $this->requestCache[$key];
         }
 
+        // Skip Redis entirely while the circuit breaker is open (recent outage).
+        if ($this->circuitOpen()) {
+            return null;
+        }
+
+        // L2 Cache: read from Redis. Any I/O failure (phpredis \RedisException
+        // or a predis connection exception) trips the breaker — catch \Throwable
+        // so it is client-agnostic — and reports a miss.
         try {
-            // L2 Cache: Check Redis
             $fullKey = $this->buildFullKey($key);
             $data = $this->redis->hgetall($fullKey);
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'get');
+            return null;
+        }
 
-            // Treat a hash that exists but has no 'result' field as a miss.
-            // recordHit()'s HINCRBY can resurrect a just-expired key into a
-            // TTL-less hash holding only {hits, last_accessed} and no 'result'.
-            // Returning it would hand the caller ['result' => null] — a wrong,
-            // sticky null. Missing instead makes the query re-run and put()
-            // rewrite a complete entry with a fresh TTL (self-healing).
-            if (empty($data) || !isset($data['result'])) {
-                return null;
-            }
+        // Treat a hash that exists but has no 'result' field as a miss.
+        // recordHit()'s HINCRBY can resurrect a just-expired key into a
+        // TTL-less hash holding only {hits, last_accessed} and no 'result'.
+        // Returning it would hand the caller ['result' => null] — a wrong,
+        // sticky null. Missing instead makes the query re-run and put()
+        // rewrite a complete entry with a fresh TTL (self-healing).
+        if (empty($data) || !isset($data['result'])) {
+            return null;
+        }
 
-            // Reconstruct array from Hash
+        // Decode separately: a corrupt/unreadable payload is a data problem,
+        // NOT a Redis outage, so it must report a miss (self-healing) without
+        // tripping the breaker.
+        try {
             $cached = [
-                'result' => isset($data['result']) ? $this->unserializeResult($data['result']) : null,
+                'result' => $this->unserializeResult($data['result']),
                 'query' => $data['query'] ?? '',
                 'executed_at' => (float)($data['executed_at'] ?? 0),
                 'cached_at' => (float)($data['cached_at'] ?? 0),
@@ -209,27 +275,54 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                 'tables' => isset($data['tables']) && $data['tables'] !== '' ? json_decode($data['tables'], true) : null,
                 'last_accessed' => isset($data['last_accessed']) ? (float)$data['last_accessed'] : null,
             ];
-
-            // Store in L1 cache for this request
-            $this->requestCache[$key] = $cached;
-
-            return $cached;
-        } catch (\RedisException $e) {
-            // Redis connection/timeout errors - always log these
-            Log::error('Query Cache (Redis): Connection/timeout error', [
-                'key' => $key,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-            return null;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to get from Hash', [
+                Log::warning('Query Cache (Redis): undecodable cache payload, treating as miss', [
                     'key' => $key,
-                    'error' => $e->getMessage()
+                    'error' => $e->getMessage(),
                 ]);
             }
             return null;
+        }
+
+        // Store in L1 cache for this request
+        $this->requestCache[$key] = $cached;
+
+        return $cached;
+    }
+
+    /**
+     * Whether the Redis circuit breaker is currently open.
+     */
+    private function circuitOpen(): bool
+    {
+        return $this->circuitOpenUntil !== null && microtime(true) < $this->circuitOpenUntil;
+    }
+
+    /**
+     * Open the circuit breaker after a Redis failure. Logs once per window
+     * (not once per query) so an outage doesn't flood the log.
+     */
+    private function tripCircuit(\Throwable $e, string $op): void
+    {
+        $alreadyOpen = $this->circuitOpen();
+        $this->circuitOpenUntil = microtime(true) + self::CIRCUIT_COOLDOWN_SECONDS;
+
+        if (!$alreadyOpen) {
+            Log::error('Query Cache (Redis): connection/timeout error — skipping cache for ' . self::CIRCUIT_COOLDOWN_SECONDS . 's', [
+                'op' => $op,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Close the breaker after a successful Redis call.
+     */
+    private function closeCircuit(): void
+    {
+        if ($this->circuitOpenUntil !== null) {
+            $this->circuitOpenUntil = null;
         }
     }
 
@@ -239,7 +332,6 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     public function put(string $key, mixed $result, string $query, float $executedAt): void
     {
         $now = microtime(true);
-        $ttl = $this->config['ttl'];
 
         // Extract tables upfront for indexing (required for efficient invalidation)
         $tables = SqlTableExtractor::extract($query);
@@ -255,15 +347,27 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'last_accessed' => null,
         ];
 
+        // Keep the L1 entry but skip L2 while the breaker is open.
+        if ($this->circuitOpen()) {
+            return;
+        }
+
         try {
             $fullKey = $this->buildFullKey($key);
             $serialized = $this->serializeResult($result);
             $tablesJson = json_encode($tables);
+            $ttl = $this->ttlWithJitter();
+            $keysSet = $this->keysSet;
+            $tablesSet = $this->tablesSet;
+            $tableIndexPrefix = $this->tableIndexPrefix;
 
-            // Atomic write via MULTI/EXEC — guarantees both HMSET and EXPIRE
-            // either both commit or both roll back. A network blip between the
-            // two commands previously left keys without TTL (persistent forever).
-            $this->redis->transaction(function ($tx) use ($fullKey, $serialized, $query, $executedAt, $now, $tablesJson, $ttl) {
+            // One MULTI/EXEC writes the data hash, its TTL, the key-tracking Set
+            // membership and every table index together. Doing the index writes
+            // inside the same transaction (not afterward) means a crash can
+            // never leave a live-but-unindexed key that nothing can invalidate.
+            // (Multi-key MULTI assumes a single Redis node — see README for the
+            // Redis Cluster caveat.)
+            $this->redis->transaction(function ($tx) use ($fullKey, $serialized, $query, $executedAt, $now, $tablesJson, $ttl, $key, $keysSet, $tablesSet, $tableIndexPrefix, $tables) {
                 $tx->hmset($fullKey, [
                     'result' => $serialized,
                     'query' => $query,
@@ -273,27 +377,33 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                     'tables' => $tablesJson,
                 ]);
                 $tx->expire($fullKey, $ttl);
+                $tx->sadd($keysSet, $key);
+                foreach ($tables as $table) {
+                    $tx->sadd($tableIndexPrefix . $table, $key);
+                    $tx->sadd($tablesSet, $table);
+                }
             });
 
-            // Track this key in our Set for efficient listing (AWS/Valkey compatible)
-            $this->addKeyToSet($key);
-
-            // Index this key by each table for O(1) invalidation lookup
-            $this->addKeyToTableIndexes($key, $tables);
-        } catch (\RedisException $e) {
-            // Redis connection/timeout errors - always log these
-            Log::error('Query Cache (Redis): Connection/timeout error on put', [
-                'key' => $key,
-                'error' => $e->getMessage()
-            ]);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to put to Hash', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
-            }
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            // Client-agnostic: trip the breaker on any Redis I/O failure. The
+            // L1 entry written above still serves this request.
+            $this->tripCircuit($e, 'put');
         }
+    }
+
+    /**
+     * TTL with up to +10% jitter so a burst of entries created together don't
+     * all expire on the same tick and stampede the database.
+     */
+    private function ttlWithJitter(): int
+    {
+        $ttl = (int) $this->config['ttl'];
+        if ($ttl <= 1) {
+            return $ttl;
+        }
+
+        return $ttl + random_int(0, (int) ceil($ttl * 0.1));
     }
 
     /**
@@ -384,41 +494,78 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     public function getStats(): array
     {
+        $empty = [
+            'driver' => 'redis',
+            'cached_queries_count' => 0,
+            'total_cache_hits' => 0,
+            'queries' => [],
+        ];
+
         // Get all tracked keys from our Set (AWS/Valkey compatible)
         $keys = $this->getAllTrackedKeys();
 
         if (empty($keys)) {
-            return [
-                'driver' => 'redis',
-                'cached_queries_count' => 0,
-                'total_cache_hits' => 0,
-                'queries' => [],
-            ];
+            return $empty;
         }
 
-        $cacheData = $this->pipelineGet($keys);
+        try {
+            // Metadata only via HMGET — never pull the (potentially large)
+            // 'result' blob just to count/list cached queries.
+            $rows = $this->redis->pipeline(function ($pipe) use ($keys) {
+                foreach ($keys as $key) {
+                    $pipe->hmget($this->buildFullKey($key), ['query', 'tables', 'hits', 'cached_at']);
+                }
+            });
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'getStats');
+            return $empty;
+        }
 
         $queries = [];
         $totalHits = 0;
+        $deadKeys = [];
 
         foreach ($keys as $i => $key) {
-            $cached = $cacheData[$i] ?? null;
-
-            if ($cached) {
-                // Lazy-load tables if not already extracted
-                if (!isset($cached['tables']) || $cached['tables'] === null) {
-                    $cached['tables'] = SqlTableExtractor::extract($cached['query']);
-                }
-
-                $queries[] = [
-                    'query' => $cached['query'],
-                    'tables' => $cached['tables'],
-                    'hits' => $cached['hits'] ?? 0,
-                    'cached_at' => $cached['cached_at'] ?? 0
-                ];
-
-                $totalHits += $cached['hits'] ?? 0;
+            $row = $rows[$i] ?? null;
+            if (!is_array($row)) {
+                $deadKeys[] = $key;
+                continue;
             }
+
+            // Normalize phpredis (assoc, keyed by field) vs predis (positional).
+            $queryStr = $row['query'] ?? ($row[0] ?? null);
+            $tablesRaw = $row['tables'] ?? ($row[1] ?? null);
+            $hits = $row['hits'] ?? ($row[2] ?? null);
+            $cachedAt = $row['cached_at'] ?? ($row[3] ?? null);
+
+            if ($queryStr === null || $queryStr === false) {
+                // Hash expired (TTL) but the key lingered in the tracking Set.
+                $deadKeys[] = $key;
+                continue;
+            }
+
+            $tables = (is_string($tablesRaw) && $tablesRaw !== '')
+                ? json_decode($tablesRaw, true)
+                : null;
+            if ($tables === null) {
+                $tables = SqlTableExtractor::extract($queryStr);
+            }
+
+            $hits = (int) $hits;
+            $queries[] = [
+                'query' => $queryStr,
+                'tables' => $tables,
+                'hits' => $hits,
+                'cached_at' => (float) $cachedAt,
+            ];
+            $totalHits += $hits;
+        }
+
+        // Reconcile: drop tracking-Set members whose hash has expired, so the
+        // Set can't grow unbounded with dead references over time.
+        if (!empty($deadKeys)) {
+            $this->pruneTrackedKeys($deadKeys);
         }
 
         return [
@@ -445,6 +592,10 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             return;
         }
 
+        if ($this->circuitOpen()) {
+            return;
+        }
+
         // Invalidate L1 cache so next get() fetches updated hits from Redis
         unset($this->requestCache[$key]);
 
@@ -452,28 +603,19 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             $fullKey = $this->buildFullKey($key);
             $now = microtime(true);
 
-            // Atomic increment hits counter
-            $this->redis->hincrby($fullKey, 'hits', 1);
+            // Both writes in one pipeline (one round-trip). TTL is intentionally
+            // NOT refreshed: it bounds staleness since put(), not idle time —
+            // refreshing on every hit let hot keys live forever and serve stale
+            // data. HINCRBY can resurrect a just-expired key into a result-less
+            // hash; get() guards against that zombie.
+            $this->redis->pipeline(function ($pipe) use ($fullKey, $now) {
+                $pipe->hincrby($fullKey, 'hits', 1);
+                $pipe->hset($fullKey, 'last_accessed', (string)$now);
+            });
 
-            // Update last_accessed timestamp
-            $this->redis->hset($fullKey, 'last_accessed', (string)$now);
-
-            // TTL is intentionally not refreshed here: it represents the maximum
-            // acceptable staleness since put(), not an idle timeout. Refreshing
-            // on every hit caused frequently-read keys to never expire and
-            // serve stale data indefinitely.
-        } catch (\RedisException $e) {
-            Log::error('Query Cache (Redis): Connection/timeout error on recordHit', [
-                'key' => $key,
-                'error' => $e->getMessage()
-            ]);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to record hit', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
-            }
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'recordHit');
         }
     }
 
@@ -496,27 +638,6 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     }
 
     /**
-     * Add a key to the tracking Set
-     *
-     * @param string $key
-     * @return void
-     */
-    private function addKeyToSet(string $key): void
-    {
-        try {
-            // Add to Set using SADD (AWS/Valkey compatible)
-            $this->redis->sadd($this->keysSet, $key);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to add key to tracking set', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
-            }
-        }
-    }
-
-    /**
      * Remove a key from the tracking Set
      *
      * @param string $key
@@ -531,39 +652,6 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             if ($this->config['log_enabled']) {
                 Log::warning('Query Cache (Redis): Failed to remove key from tracking set', [
                     'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
-            }
-        }
-    }
-
-    /**
-     * Add a key to table-based indexes for O(1) invalidation lookup
-     *
-     * @param string $key
-     * @param array $tables
-     * @return void
-     */
-    private function addKeyToTableIndexes(string $key, array $tables): void
-    {
-        if (empty($tables)) {
-            return;
-        }
-
-        try {
-            // Use pipeline to add key to all table indexes in one roundtrip
-            $this->redis->pipeline(function ($pipe) use ($key, $tables) {
-                foreach ($tables as $table) {
-                    $indexKey = $this->tableIndexPrefix . $table;
-                    $pipe->sadd($indexKey, $key);
-                    $pipe->sadd($this->tablesSet, $table);
-                }
-            });
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to add key to table indexes', [
-                    'key' => $key,
-                    'tables' => $tables,
                     'error' => $e->getMessage()
                 ]);
             }
@@ -672,27 +760,65 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         }
 
         try {
-            // Pipeline all deletions: cache entries, tracking set removal, and table index cleanup
-            $this->redis->pipeline(function ($pipe) use ($keys, $affectedTables) {
+            // Read each key's own table list so we can remove it from ALL of its
+            // table indexes — not just the tables that triggered this
+            // invalidation. Otherwise a key referencing [users, posts] that is
+            // invalidated via `users` lingers forever in the `posts` index.
+            $tablesByKey = $this->redis->pipeline(function ($pipe) use ($keys) {
                 foreach ($keys as $key) {
-                    $fullKey = $this->buildFullKey($key);
-                    $pipe->del($fullKey);
+                    $pipe->hget($this->buildFullKey($key), 'tables');
+                }
+            });
+
+            $this->redis->pipeline(function ($pipe) use ($keys, $affectedTables, $tablesByKey) {
+                foreach ($keys as $i => $key) {
+                    $pipe->del($this->buildFullKey($key));
                     $pipe->srem($this->keysSet, $key);
 
-                    // Remove from all affected table indexes
-                    foreach ($affectedTables as $table) {
-                        $indexKey = $this->tableIndexPrefix . $table;
-                        $pipe->srem($indexKey, $key);
+                    $raw = $tablesByKey[$i] ?? null;
+                    $ownTables = (is_string($raw) && $raw !== '') ? (json_decode($raw, true) ?: []) : [];
+
+                    // Union of the key's own tables and the invalidation's
+                    // tables (the latter covers already-expired keys whose
+                    // 'tables' field is gone).
+                    foreach (array_unique(array_merge($ownTables, $affectedTables)) as $table) {
+                        $pipe->srem($this->tableIndexPrefix . $table, $key);
                     }
                 }
             });
-        } catch (\Exception $e) {
+
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
             if ($this->config['log_enabled']) {
                 Log::warning('Query Cache (Redis): Failed to pipeline delete with index cleanup', [
                     'keys_count' => count($keys),
                     'error' => $e->getMessage()
                 ]);
             }
+        }
+    }
+
+    /**
+     * Remove leaked members from the key-tracking Set (keys whose hash has
+     * already expired via TTL). Best-effort housekeeping; failures are ignored.
+     *
+     * @param array $keys
+     * @return void
+     */
+    private function pruneTrackedKeys(array $keys): void
+    {
+        if (empty($keys)) {
+            return;
+        }
+
+        try {
+            $this->redis->pipeline(function ($pipe) use ($keys) {
+                foreach ($keys as $key) {
+                    $pipe->srem($this->keysSet, $key);
+                }
+            });
+        } catch (\Throwable $e) {
+            // Housekeeping only — ignore.
         }
     }
 
@@ -823,53 +949,6 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         }
 
         return $invalidatedCount;
-    }
-
-    /**
-     * Use Redis pipelining to GET multiple keys in one roundtrip
-     *
-     * @param array $keys
-     * @return array
-     */
-    private function pipelineGet(array $keys): array
-    {
-        try {
-            // Use Redis pipeline for batch HGETALL operations
-            // pipeline() returns an array of results
-            $results = $this->redis->pipeline(function ($pipe) use ($keys) {
-                foreach ($keys as $key) {
-                    $fullKey = $this->buildFullKey($key);
-                    $pipe->hgetall($fullKey);
-                }
-            });
-
-            // Reconstruct arrays from Hashes
-            $reconstructed = [];
-            foreach ($results as $data) {
-                if ($data && is_array($data) && !empty($data)) {
-                    $reconstructed[] = [
-                        'result' => isset($data['result']) ? $this->unserializeResult($data['result']) : null,
-                        'query' => $data['query'] ?? '',
-                        'executed_at' => (float)($data['executed_at'] ?? 0),
-                        'cached_at' => (float)($data['cached_at'] ?? 0),
-                        'hits' => (int)($data['hits'] ?? 0),
-                        'tables' => isset($data['tables']) && $data['tables'] !== '' ? json_decode($data['tables'], true) : null,
-                        'last_accessed' => isset($data['last_accessed']) ? (float)$data['last_accessed'] : null,
-                    ];
-                } else {
-                    $reconstructed[] = null;
-                }
-            }
-
-            return $reconstructed;
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to pipeline GET', [
-                    'error' => $e->getMessage()
-                ]);
-            }
-            return array_fill(0, count($keys), null);
-        }
     }
 
     /**

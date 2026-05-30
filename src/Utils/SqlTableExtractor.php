@@ -16,7 +16,7 @@ class SqlTableExtractor
         . '|(?:NATURAL\s++)?+(?:(?:LEFT|RIGHT|FULL)(?:\s++OUTER)?+\s++|INNER\s++|CROSS\s++)?+JOIN'
         . '|STRAIGHT_JOIN'
         . '|UPDATE'
-        . '|(?:INSERT|REPLACE)\s++INTO'
+        . '|(?:INSERT|REPLACE|MERGE)\s++INTO'
         . '|DELETE\s++FROM'
         . '|TRUNCATE(?:\s++TABLE)?+'
         . '|ALTER\s++TABLE'
@@ -25,21 +25,12 @@ class SqlTableExtractor
         . ')\s++';
 
     /**
-     * Fast path (no comma in the SQL): one keyword introduces one table reference.
-     * Captures the trailing identifier directly, ignoring an optional schema prefix
-     * and surrounding quotes.
-     */
-    private const SINGLE_REF_PATTERN = '~' . self::KEYWORD
-        . '(?:["`\[]?+\w++["`\]]?+\s*+\.\s*+)?+'
-        . '["`\[]?+(\w++)["`\]]?+'
-        . '~i';
-
-    /**
-     * Slow path (the SQL contains a comma): captures the whole table list after
-     * each keyword as a single group; the list is split and normalized in PHP,
-     * which is cheaper than per-segment regex calls. Kept distinct from
-     * SINGLE_REF_PATTERN because adding the comma-list repetition to the fast
-     * path measurably defeats PCRE's first-byte scan optimization.
+     * Captures the table reference(s) introduced by each keyword as a single
+     * group: a leading reference plus any comma-separated siblings (old-style
+     * implicit joins). The group is split and normalized in PHP. One pattern
+     * handles the single-table, JOIN and comma-list cases uniformly — a former
+     * fast/slow split mis-routed comma-joined FROM lists whose first comma fell
+     * in the SELECT projection and silently dropped every table after the first.
      */
     private const LIST_PATTERN = '~' . self::KEYWORD
         . '('
@@ -81,38 +72,19 @@ class SqlTableExtractor
             return self::$cache[$sql];
         }
 
-        // Decide whether the comma-list pattern is actually needed. The fast
-        // single-ref pattern can be used when:
-        //   - there is no comma at all, OR
-        //   - the first `(` precedes the first `,` (the comma is inside a
-        //     column/value list or CTE body, never a table list), OR
-        //   - the first `,` precedes any `FROM` keyword (it's in the SELECT
-        //     column list, e.g. `SELECT a, b FROM t`).
-        // Each check is a plain strpos/stripos — cheaper than the slow path's
-        // regex repetition for the common case.
-        $useListPath = false;
-        $commaPos = strpos($sql, ',');
-        if ($commaPos !== false) {
-            $parenPos = strpos($sql, '(');
-            if ($parenPos === false || $parenPos > $commaPos) {
-                $fromPos = stripos($sql, 'FROM');
-                $useListPath = $fromPos === false || $commaPos > $fromPos;
-            }
-        }
-
-        if (!$useListPath) {
-            preg_match_all(self::SINGLE_REF_PATTERN, $sql, $matches);
-            $tables = $matches[1];
-        } else {
-            preg_match_all(self::LIST_PATTERN, $sql, $matches);
-            $tables = [];
-            foreach ($matches[1] as $list) {
-                if (strpos($list, ',') === false) {
-                    $tables[] = self::normalizeRef($list);
-                } else {
-                    foreach (explode(',', $list) as $ref) {
-                        $tables[] = self::normalizeRef($ref);
-                    }
+        // A single pass with the list-capable pattern handles single-table,
+        // JOIN and comma-separated (implicit join) references uniformly. Each
+        // captured group is the reference list following one keyword; split it
+        // on commas and normalize each segment. (Memoized per request, so the
+        // cost of the richer pattern is paid at most once per distinct query.)
+        preg_match_all(self::LIST_PATTERN, $sql, $matches);
+        $tables = [];
+        foreach ($matches[1] as $list) {
+            if (strpos($list, ',') === false) {
+                $tables[] = self::normalizeRef($list);
+            } else {
+                foreach (explode(',', $list) as $ref) {
+                    $tables[] = self::normalizeRef($ref);
                 }
             }
         }

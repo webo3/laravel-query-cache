@@ -57,6 +57,7 @@ class QueryCacheServiceProvider extends ServiceProvider
                         'log_enabled' => config('db-cache.log_enabled', false),
                         'redis_connection' => config('db-cache.redis_connection', 'db_cache'),
                         'excluded_tables' => $excludedTables,
+                        'tenant_required' => config('db-cache.tenant_required', false),
                     ],
                 ]);
             }

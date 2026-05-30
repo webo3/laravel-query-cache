@@ -465,6 +465,60 @@ class RedisQueryCacheDriverTest extends TestCase
             "Expected at least 30% compression. Original: {$originalSize} bytes, Compressed: {$compressedSize} bytes");
     }
 
+    #[Test]
+    public function get_treats_an_undecodable_payload_as_a_miss()
+    {
+        $key = 'test_undecodable_' . time();
+        $this->driver->put($key, ['ok'], 'SELECT * FROM t', microtime(true));
+
+        // Corrupt the stored payload with bytes carrying no valid format marker.
+        $fullKey = $this->buildFullKey($key);
+        $this->redis->hset($fullKey, 'result', 'XXnot-a-valid-payload');
+
+        // Drop L1 so get() must decode the corrupt L2 entry.
+        $this->driver->flushRequestCache();
+
+        $this->assertNull($this->driver->get($key), 'An undecodable payload must be treated as a cache miss');
+    }
+
+    #[Test]
+    public function get_stats_prunes_tracking_set_members_whose_hash_expired()
+    {
+        // Simulate a key that expired by TTL but lingered in the tracking Set.
+        $ghost = 'ghost_' . time();
+        $this->redis->sadd('db_cache:keys', $ghost);
+        $this->assertContains($ghost, $this->redis->smembers('db_cache:keys'));
+
+        // getStats() reconciles: a Set member with no live hash is removed.
+        $this->driver->getStats();
+
+        $this->assertNotContains($ghost, $this->redis->smembers('db_cache:keys'), 'Dead tracking-Set members must be pruned on getStats()');
+    }
+
+    #[Test]
+    public function invalidation_removes_a_key_from_all_of_its_table_indexes()
+    {
+        $key = 'test_multi_index_' . time();
+        $this->driver->put(
+            $key,
+            ['row'],
+            'SELECT * FROM users JOIN posts ON users.id = posts.user_id',
+            microtime(true)
+        );
+
+        // Indexed under both tables.
+        $this->assertContains($key, $this->redis->smembers('db_cache:table:users'));
+        $this->assertContains($key, $this->redis->smembers('db_cache:table:posts'));
+
+        // Invalidate via ONE of the tables.
+        $this->driver->invalidateTables(['users'], 'UPDATE users SET name = "x"');
+
+        // The key must be gone from BOTH indexes (not left dangling in posts).
+        $this->assertNotContains($key, $this->redis->smembers('db_cache:table:users'));
+        $this->assertNotContains($key, $this->redis->smembers('db_cache:table:posts'), 'Invalidated key must be removed from all its table indexes');
+        $this->assertNotContains($key, $this->redis->smembers('db_cache:keys'));
+    }
+
     /**
      * Build full Redis key with Laravel prefix
      */

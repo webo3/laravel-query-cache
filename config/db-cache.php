@@ -123,4 +123,27 @@ return [
 
     'excluded_tables' => env('DB_QUERY_CACHE_EXCLUDED_TABLES', []),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Require Tenant Context (multi-tenant safety)
+    |--------------------------------------------------------------------------
+    |
+    | Cache keys are namespaced by tenant only AFTER you call
+    | $connection->setTenantContext($tenantId). In a multi-tenant app that
+    | shares one database connection across tenants, forgetting that call would
+    | let every tenant read the same un-namespaced cache — a cross-tenant data
+    | leak.
+    |
+    | Set this to true to fail safe: while no tenant context has been set on a
+    | connection, caching is fully bypassed (no reads, writes, or invalidation),
+    | so a missing setTenantContext() degrades to "no caching" instead of
+    | leaking. Wire setTenantContext() into your tenancy middleware/bootstrapper
+    | so the context is always present before queries run.
+    |
+    | Leave false for single-tenant apps.
+    |
+    */
+
+    'tenant_required' => env('DB_QUERY_CACHE_TENANT_REQUIRED', false),
+
 ];

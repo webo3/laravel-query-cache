@@ -540,4 +540,57 @@ class SqlTableExtractorTest extends TestCase
         $this->assertContains('users', $tables);
         $this->assertContains('orders', $tables);
     }
+
+    // ===================================
+    // Regression: comma-joined FROM with a projection comma before FROM
+    // (the former fast/slow heuristic dropped every table after the first)
+    // ===================================
+
+    #[Test]
+    public function it_extracts_comma_joined_tables_when_a_comma_precedes_from()
+    {
+        $tables = SqlTableExtractor::extract(
+            'SELECT users.id, orders.id FROM users, orders WHERE users.id = orders.user_id'
+        );
+        $this->assertContains('users', $tables);
+        $this->assertContains('orders', $tables);
+    }
+
+    #[Test]
+    public function it_extracts_comma_joined_tables_with_function_in_projection()
+    {
+        $tables = SqlTableExtractor::extract(
+            'SELECT COUNT(a.id), b.name FROM accounts a, balances b'
+        );
+        // First table of each comma segment is extracted (aliases ignored for
+        // the simple non-aliased case; see normalizeRef).
+        $this->assertContains('accounts', $tables);
+    }
+
+    // ===================================
+    // MERGE target extraction
+    // ===================================
+
+    #[Test]
+    public function it_extracts_target_table_from_merge()
+    {
+        $tables = SqlTableExtractor::extract(
+            'MERGE INTO accounts USING staging ON accounts.id = staging.id WHEN MATCHED THEN UPDATE SET balance = staging.balance'
+        );
+        $this->assertContains('accounts', $tables);
+    }
+
+    // ===================================
+    // Data-modifying / top-level-DML CTE: real tables extracted, alias filtered
+    // ===================================
+
+    #[Test]
+    public function it_extracts_base_and_target_tables_from_cte_delete()
+    {
+        $tables = SqlTableExtractor::extract(
+            'WITH stale AS (SELECT id FROM sessions WHERE expired = 1) DELETE FROM sessions WHERE id IN (SELECT id FROM stale)'
+        );
+        $this->assertContains('sessions', $tables);
+        $this->assertNotContains('stale', $tables);
+    }
 }

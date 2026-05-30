@@ -58,6 +58,7 @@ This creates `config/db-cache.php` in your application.
 | `DB_QUERY_CACHE_CONNECTION` | `mysql` | Database connection name(s) to cache |
 | `DB_QUERY_CACHE_REDIS_CONNECTION` | `db_cache` | Redis connection name (redis driver only) |
 | `DB_QUERY_CACHE_EXCLUDED_TABLES` | _(empty)_ | Comma-separated identifiers (views, etc.) that must never be cached |
+| `DB_QUERY_CACHE_TENANT_REQUIRED` | `false` | Bypass caching until `setTenantContext()` is set (multi-tenant fail-safe) |
 
 ### Quick Start
 
@@ -302,6 +303,8 @@ DB_QUERY_CACHE_CONNECTION=main,org
 
 The `main` connection caches globally, while the `org` connection caches per-tenant after `setTenantContext()` is called.
 
+> **Fail-safe for multi-tenant connections.** If a tenant-spanning connection forgets to call `setTenantContext()`, every tenant would share one un-namespaced cache — a cross-tenant leak. Set `DB_QUERY_CACHE_TENANT_REQUIRED=true` (or `'tenant_required' => true` in `config/db-cache.php`) to make this fail safe: caching is fully bypassed (no reads, writes, or invalidation) until a tenant context has been set, so a missing `setTenantContext()` degrades to "no caching" instead of leaking. Leave it `false` for single-tenant apps.
+
 ## Artisan Command
 
 Clear the query cache from the command line:
@@ -373,6 +376,24 @@ if ($connection instanceof CachedConnection) {
 4. **Query normalization** ensures that queries with different casing or whitespace produce the same cache key (e.g. `SELECT * FROM users` and `select *  from  users` hit the same cache entry).
 
 5. **Cursor queries** (`DB::cursor()`) are never cached, as they are designed for memory-efficient streaming of large result sets.
+
+## Consistency & Caveats
+
+### Eventual consistency
+
+This is a read-through (cache-aside) cache, so reads are **eventually consistent**, not strongly consistent:
+
+- A cached result can be at most **`ttl` seconds** stale. Keep `DB_QUERY_CACHE_TTL` short for write-heavy tables.
+- **Transaction-aware:** `SELECT`s executed inside an open transaction are **not** cached (they could observe this connection's own uncommitted rows), and a write's invalidation is **deferred to commit** — it fires after `COMMIT` and is dropped on `ROLLBACK`.
+- **Locking reads** (`SELECT … FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE`) are never cached, so they always take their lock against the database.
+- Under concurrency, a narrow **lost-invalidation window** remains: if a reader reads the old row, a writer commits + invalidates, and only then does the reader write its (now-stale) entry, that entry lives until its TTL. There is **no single-flight lock** on a cache miss, so a very hot key can briefly stampede the database when it expires — TTL jitter (±10%, applied automatically) spreads synchronized expiries out.
+- Queries the table extractor can't attribute to a table (e.g. `CALL` a stored procedure) conservatively **flush the entire cache** for that connection on mutation, which is safe but coarse.
+
+If you require read-your-writes within a request, read through the same connection inside the transaction (bypassed) or call `DB::connection(...)->clearQueryCache()` after the critical write.
+
+### Redis Cluster
+
+The Redis driver's `put()` writes the data hash, the key-tracking set, and the per-table indexes in **one `MULTI/EXEC` transaction that spans multiple keys**. On **Redis Cluster** those keys can hash to different slots, which makes the transaction fail. Point the `db_cache` connection at a **single Redis node/instance** (the recommended setup — a dedicated database keeps it isolated; see [Redis Driver](#redis-driver)). Standalone Redis, AWS ElastiCache / Valkey in non-clustered mode, and a single primary are all fine; clustered mode is not currently supported.
 
 ## Custom Cache Drivers
 
