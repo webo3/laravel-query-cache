@@ -6,13 +6,20 @@ use Illuminate\Console\Command;
 use webO3\LaravelDbCache\Contracts\CachedConnection;
 use webO3\LaravelDbCache\Support\ConfigList;
 
-class ClearQueryCacheCommand extends Command
+/**
+ * Reconciles the Redis driver's tracking sets and table indexes with reality:
+ * members whose data hash has expired via TTL are removed. Without periodic
+ * pruning, read-mostly tables (whose indexes are never cleaned by mutation)
+ * accumulate dead references between their TTL refreshes.
+ *
+ * Schedule it, e.g.: $schedule->command('db-cache:prune')->hourly();
+ */
+class PruneQueryCacheCommand extends Command
 {
-    protected $signature = 'db-cache:clear
-                            {--connection= : Specific connection to clear (default: all cached connections)}
-                            {--tenant= : Clear cache for a specific tenant ID only (redis driver; default clears every namespace)}';
+    protected $signature = 'db-cache:prune
+                            {--connection= : Specific connection to prune (default: all cached connections)}';
 
-    protected $description = 'Clear the database query cache';
+    protected $description = 'Remove stale tracking-set and index references from the database query cache';
 
     public function handle(): int
     {
@@ -24,13 +31,13 @@ class ClearQueryCacheCommand extends Command
         }
 
         foreach ($connectionNames as $name) {
-            $this->clearConnection($name);
+            $this->pruneConnection($name);
         }
 
         return self::SUCCESS;
     }
 
-    private function clearConnection(string $name): void
+    private function pruneConnection(string $name): void
     {
         try {
             $connection = app('db')->connection($name);
@@ -44,18 +51,8 @@ class ClearQueryCacheCommand extends Command
             return;
         }
 
-        $tenantId = $this->option('tenant');
-
-        if ($tenantId) {
-            $connection->setTenantContext($tenantId);
-            $connection->clearQueryCache();
-            $this->components->info("Cleared query cache for connection [{$name}], tenant [{$tenantId}].");
-        } else {
-            // Without a tenant context the driver clears the default namespace
-            // plus every namespace in the tenant registry.
-            $connection->clearQueryCache();
-            $this->components->info("Cleared query cache for connection [{$name}] (all tenant namespaces).");
-        }
+        $removed = $connection->pruneQueryCache();
+        $this->components->info("Pruned {$removed} stale cache reference(s) for connection [{$name}].");
     }
 
     private function getConnectionNames(): array

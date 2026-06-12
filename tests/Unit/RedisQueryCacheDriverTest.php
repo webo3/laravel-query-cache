@@ -161,7 +161,7 @@ class RedisQueryCacheDriverTest extends TestCase
         $this->assertEquals(['users'], $cached['tables']);
 
         // Verify key is indexed in table-specific set
-        $tableIndexKey = 'db_cache:table:users';
+        $tableIndexKey = $this->setKey('db_cache:table:users');
         $keysInTableIndex = $this->redis->smembers($tableIndexKey);
         $this->assertContains($key, $keysInTableIndex);
     }
@@ -184,7 +184,7 @@ class RedisQueryCacheDriverTest extends TestCase
         $this->assertContains($key2, $allKeys);
 
         // Verify using direct Redis SMEMBERS
-        $keysInSet = $this->redis->smembers('db_cache:keys');
+        $keysInSet = $this->redis->smembers($this->setKey('db_cache:keys'));
         $this->assertContains($key1, $keysInSet);
         $this->assertContains($key2, $keysInSet);
     }
@@ -204,7 +204,7 @@ class RedisQueryCacheDriverTest extends TestCase
         $this->assertFalse($this->driver->has($key));
 
         // Verify removed from tracking Set
-        $keysInSet = $this->redis->smembers('db_cache:keys');
+        $keysInSet = $this->redis->smembers($this->setKey('db_cache:keys'));
         $this->assertNotContains($key, $keysInSet);
     }
 
@@ -256,7 +256,7 @@ class RedisQueryCacheDriverTest extends TestCase
         $this->assertEquals(0, $statsAfter['cached_queries_count']);
 
         // Verify tracking Set is empty
-        $keysInSet = $this->redis->smembers('db_cache:keys');
+        $keysInSet = $this->redis->smembers($this->setKey('db_cache:keys'));
         $this->assertEmpty($keysInSet);
     }
 
@@ -385,6 +385,11 @@ class RedisQueryCacheDriverTest extends TestCase
 
         // The zombie exists in Redis...
         $this->assertEquals(1, $this->redis->exists($fullKey));
+
+        // Drop L1 (recordHit now updates the L1 entry in place instead of
+        // evicting it) so get() must read the zombie from L2.
+        $driver->flushRequestCache();
+
         // ...but get() must report a miss, not hand back result => null.
         $this->assertNull($driver->get($key));
 
@@ -486,13 +491,13 @@ class RedisQueryCacheDriverTest extends TestCase
     {
         // Simulate a key that expired by TTL but lingered in the tracking Set.
         $ghost = 'ghost_' . time();
-        $this->redis->sadd('db_cache:keys', $ghost);
-        $this->assertContains($ghost, $this->redis->smembers('db_cache:keys'));
+        $this->redis->sadd($this->setKey('db_cache:keys'), $ghost);
+        $this->assertContains($ghost, $this->redis->smembers($this->setKey('db_cache:keys')));
 
         // getStats() reconciles: a Set member with no live hash is removed.
         $this->driver->getStats();
 
-        $this->assertNotContains($ghost, $this->redis->smembers('db_cache:keys'), 'Dead tracking-Set members must be pruned on getStats()');
+        $this->assertNotContains($ghost, $this->redis->smembers($this->setKey('db_cache:keys')), 'Dead tracking-Set members must be pruned on getStats()');
     }
 
     #[Test]
@@ -507,16 +512,153 @@ class RedisQueryCacheDriverTest extends TestCase
         );
 
         // Indexed under both tables.
-        $this->assertContains($key, $this->redis->smembers('db_cache:table:users'));
-        $this->assertContains($key, $this->redis->smembers('db_cache:table:posts'));
+        $this->assertContains($key, $this->redis->smembers($this->setKey('db_cache:table:users')));
+        $this->assertContains($key, $this->redis->smembers($this->setKey('db_cache:table:posts')));
 
         // Invalidate via ONE of the tables.
         $this->driver->invalidateTables(['users'], 'UPDATE users SET name = "x"');
 
         // The key must be gone from BOTH indexes (not left dangling in posts).
-        $this->assertNotContains($key, $this->redis->smembers('db_cache:table:users'));
-        $this->assertNotContains($key, $this->redis->smembers('db_cache:table:posts'), 'Invalidated key must be removed from all its table indexes');
-        $this->assertNotContains($key, $this->redis->smembers('db_cache:keys'));
+        $this->assertNotContains($key, $this->redis->smembers($this->setKey('db_cache:table:users')));
+        $this->assertNotContains($key, $this->redis->smembers($this->setKey('db_cache:table:posts')), 'Invalidated key must be removed from all its table indexes');
+        $this->assertNotContains($key, $this->redis->smembers($this->setKey('db_cache:keys')));
+    }
+
+    #[Test]
+    public function tampered_payloads_fail_authentication_and_miss()
+    {
+        $key = 'test_tamper_' . time();
+        $this->driver->put($key, ['secret'], 'SELECT * FROM t', microtime(true));
+
+        // Flip the payload's last byte: the format still looks valid, but the
+        // HMAC must reject it before any unserialization happens.
+        $fullKey = $this->buildFullKey($key);
+        $raw = $this->redis->hget($fullKey, 'result');
+        $tampered = substr($raw, 0, -1) . chr(ord(substr($raw, -1)) ^ 0xFF);
+        $this->redis->hset($fullKey, 'result', $tampered);
+
+        $this->driver->flushRequestCache(); // drop L1 so get() must decode L2
+
+        $this->assertNull($this->driver->get($key), 'A payload failing HMAC authentication must be a cache miss');
+    }
+
+    #[Test]
+    public function tracking_and_index_sets_carry_a_ttl()
+    {
+        $key = 'test_index_ttl_' . time();
+        $this->driver->put($key, ['row'], 'SELECT * FROM users', microtime(true));
+
+        // Without TTLs, read-mostly tables accumulate dead members forever as
+        // their data hashes expire.
+        $this->assertGreaterThan(0, $this->redis->ttl($this->setKey('db_cache:keys')));
+        $this->assertGreaterThan(0, $this->redis->ttl($this->setKey('db_cache:tables')));
+        $this->assertGreaterThan(0, $this->redis->ttl($this->setKey('db_cache:table:users')));
+    }
+
+    #[Test]
+    public function l1_entries_are_invalidated_even_when_the_redis_index_lost_the_key()
+    {
+        $key = 'test_l1_invalidate_' . time();
+        $this->driver->put($key, ['stale row'], 'SELECT * FROM users', microtime(true));
+
+        // Simulate lost L2 state (expired hash, missing index entry) while the
+        // L1 entry is still alive in this request.
+        $this->redis->del($this->buildFullKey($key));
+        $this->redis->srem($this->setKey('db_cache:table:users'), $key);
+
+        $this->driver->invalidateTables(['users'], 'UPDATE users SET name = "x"');
+
+        $this->assertNull($this->driver->get($key), 'Invalidation must purge matching L1 entries even when the Redis index cannot see the key');
+    }
+
+    #[Test]
+    public function tenant_ids_with_namespace_separators_are_rejected()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->driver->setTenantContext('evil:tenant');
+    }
+
+    #[Test]
+    public function flush_without_tenant_context_clears_registered_tenant_namespaces()
+    {
+        $tenant = 'flushall_' . time();
+
+        $tenantDriver = new RedisQueryCacheDriver([
+            'ttl' => 300,
+            'log_enabled' => false,
+            'redis_connection' => 'db_cache',
+        ]);
+        $tenantDriver->setTenantContext($tenant);
+        $tenantDriver->put('tkey', ['tenant row'], 'SELECT * FROM users', microtime(true));
+
+        $tenantFullKey = $this->setKey("t:{$tenant}:tkey");
+        $this->assertEquals(1, $this->redis->exists($tenantFullKey));
+
+        // An untenanted flush (db-cache:clear) must clear every namespace in
+        // the tenant registry, not just the default one.
+        $this->driver->flush();
+
+        $this->assertEquals(0, $this->redis->exists($tenantFullKey), 'flush() without tenant context must clear tenant namespaces too');
+        $this->assertEmpty($this->redis->smembers($this->setKey("db_cache:t:{$tenant}:keys")));
+    }
+
+    #[Test]
+    public function prune_expired_removes_dead_tracking_and_index_references()
+    {
+        $dead = 'test_prune_dead_' . time();
+        $alive = 'test_prune_alive_' . time();
+        $this->driver->put($dead, ['row'], 'SELECT * FROM prune_table', microtime(true));
+        $this->driver->put($alive, ['row'], 'SELECT * FROM prune_table WHERE id = 1', microtime(true));
+
+        // Simulate TTL expiry of one data hash.
+        $this->redis->del($this->buildFullKey($dead));
+
+        $removed = $this->driver->pruneExpired();
+
+        $this->assertGreaterThanOrEqual(1, $removed);
+        $this->assertNotContains($dead, $this->redis->smembers($this->setKey('db_cache:keys')));
+        $this->assertNotContains($dead, $this->redis->smembers($this->setKey('db_cache:table:prune_table')));
+        $this->assertContains($alive, $this->redis->smembers($this->setKey('db_cache:keys')), 'Live keys must survive pruning');
+        $this->assertContains($alive, $this->redis->smembers($this->setKey('db_cache:table:prune_table')));
+    }
+
+    #[Test]
+    public function oversized_results_are_served_from_l1_but_never_written_to_redis()
+    {
+        $driver = new RedisQueryCacheDriver([
+            'ttl' => 300,
+            'log_enabled' => false,
+            'redis_connection' => 'db_cache',
+            'max_result_bytes' => 64,
+        ]);
+
+        $key = 'test_oversize_' . time();
+        $big = [str_repeat('x', 4096)];
+        $driver->put($key, $big, 'SELECT * FROM blobs', microtime(true));
+
+        // Served from L1 within the request...
+        $cached = $driver->get($key);
+        $this->assertEquals($big, $cached['result']);
+
+        // ...but never shipped to Redis.
+        $this->assertEquals(0, $this->redis->exists($this->buildFullKey($key)), 'Results above max_result_bytes must not be written to Redis');
+
+        $driver->flushRequestCache();
+        $this->assertNull($driver->get($key));
+    }
+
+    /**
+     * Build the full name of a tracking/index Set: set keys carry the same
+     * app/cache prefix as data keys so two apps sharing a Redis database
+     * cannot share (and mutually destroy) each other's indexes.
+     */
+    private function setKey(string $logical): string
+    {
+        $appName = config('app.name', 'laravel');
+        $appSlug = \Illuminate\Support\Str::slug($appName, '_');
+        $cachePrefix = config('cache.prefix');
+        return "{$appSlug}_database_{$cachePrefix}:{$logical}";
     }
 
     /**

@@ -510,9 +510,12 @@ abstract class AbstractCachedConnectionTest extends TestCase
     // QUERY NORMALIZATION TESTS
     // ===================================
 
-    public function test_query_caching_is_case_insensitive()
+    public function test_query_caching_is_case_sensitive()
     {
-        // Arrange
+        // Case must NOT be folded into one cache key: on case-sensitive
+        // systems (MySQL with lower_case_table_names=0) `FROM Products` and
+        // `FROM products` are different tables, and folding case would alias
+        // them to a single key — a collision serving the wrong table's rows.
 
         // Act - Execute queries with different cases
         $this->getCachedConnection()->select('select * from test_cache_products limit 1');
@@ -521,9 +524,15 @@ abstract class AbstractCachedConnectionTest extends TestCase
 
         $stats = $this->getCachedConnection()->getCacheStats();
 
-        // Assert - All variations should be treated as the same query (1 cache entry, 2 hits)
-        $this->assertEquals(1, $stats['cached_queries_count']);
-        $this->assertEquals(2, $stats['total_cache_hits']);
+        // Assert - Each case variation is its own cache entry, no hits
+        $this->assertEquals(3, $stats['cached_queries_count']);
+        $this->assertEquals(0, $stats['total_cache_hits']);
+
+        // An exact repeat (same case) still hits
+        $this->getCachedConnection()->select('select * from test_cache_products limit 1');
+        $statsAfter = $this->getCachedConnection()->getCacheStats();
+        $this->assertEquals(3, $statsAfter['cached_queries_count']);
+        $this->assertEquals(1, $statsAfter['total_cache_hits']);
     }
 
     public function test_whitespace_normalization_in_query_caching()

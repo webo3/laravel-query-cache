@@ -175,4 +175,113 @@ class CacheCorrectnessFixesTest extends TestCase
 
         $conn->statement('DROP TEMPORARY TABLE IF EXISTS fix_products');
     }
+
+    // ---- Audit fix #1: tenant context must not survive request boundaries ----
+
+    public function test_tenant_fail_safe_is_restored_at_request_boundaries()
+    {
+        config(['database.connections.mysql.db_cache.tenant_required' => true]);
+        app('db')->purge('mysql');
+        $conn = app('db')->connection('mysql');
+        $conn->statement('CREATE TEMPORARY TABLE IF NOT EXISTS fix_products (id INT PRIMARY KEY, name VARCHAR(255), price DECIMAL(10,2))');
+        $conn->clearQueryCache();
+
+        $conn->setTenantContext('tenant_a');
+        $conn->select('SELECT * FROM fix_products');
+        $this->assertGreaterThanOrEqual(1, $conn->getCacheStats()['cached_queries_count']);
+
+        // Request boundary: under Octane/queue workers the connection object
+        // persists. The tenant context must be dropped so a request that
+        // forgets setTenantContext() bypasses caching instead of silently
+        // reading the previous tenant's cache.
+        $conn->flushRequestCache();
+
+        $conn->select('SELECT * FROM fix_products');
+        $conn->select('SELECT * FROM fix_products');
+        $this->assertSame(0, $conn->getCacheStats()['cached_queries_count'], 'tenant_required fail-safe must hold again after a request boundary');
+
+        $conn->statement('DROP TEMPORARY TABLE IF EXISTS fix_products');
+    }
+
+    // ---- Audit fix #2: mutations inside a cursor loop must invalidate ----
+
+    public function test_mutation_inside_cursor_loop_invalidates_cache()
+    {
+        $this->assertSame(10.0, $this->price(1)); // caches 10
+
+        foreach ($this->connection->cursor('SELECT * FROM fix_products') as $row) {
+            $this->connection->update('UPDATE fix_products SET price = ? WHERE id = ?', [55.00, $row->id]);
+        }
+
+        $this->assertSame(55.0, $this->price(1), 'A mutation executed while iterating a cursor must invalidate the cache');
+    }
+
+    public function test_selects_during_cursor_iteration_are_cached()
+    {
+        $statsBefore = $this->connection->getCacheStats()['cached_queries_count'];
+
+        foreach ($this->connection->cursor('SELECT * FROM fix_products') as $row) {
+            $this->connection->select('SELECT name FROM fix_products WHERE id = ?', [$row->id]);
+        }
+
+        $statsAfter = $this->connection->getCacheStats()['cached_queries_count'];
+        $this->assertGreaterThan($statsBefore, $statsAfter, 'Unrelated SELECTs inside a cursor loop should be cached normally');
+    }
+
+    // ---- Audit fix #3: pretend() must not poison the cache ----
+
+    public function test_pretend_mode_does_not_poison_cache()
+    {
+        $this->connection->pretend(function ($conn) {
+            $conn->select('SELECT price FROM fix_products WHERE id = ?', [1]);
+        });
+
+        $this->assertSame(0, $this->connection->getCacheStats()['cached_queries_count'], 'Pretended queries must not create cache entries');
+
+        // The real query must return real rows, not a cached pretend [].
+        $this->assertSame(10.0, $this->price(1));
+    }
+
+    // ---- Audit fix #7: nondeterministic SELECTs must not be cached ----
+
+    public function test_nondeterministic_selects_are_not_cached()
+    {
+        $this->connection->select('SELECT NOW()');
+        $this->connection->select('SELECT RAND()');
+        $this->connection->select('SELECT UUID()');
+
+        $this->assertSame(0, $this->connection->getCacheStats()['cached_queries_count'], 'NOW()/RAND()/UUID() queries must never be cached');
+    }
+
+    // ---- Audit fix #8: SELECT ... INTO must not be cached ----
+
+    public function test_select_into_is_not_cached()
+    {
+        $this->connection->select('SELECT price INTO @audit_fix_p FROM fix_products WHERE id = 1');
+
+        $this->assertSame(0, $this->connection->getCacheStats()['cached_queries_count'], 'SELECT ... INTO has a side effect and must never be cached');
+    }
+
+    // ---- Audit fix #12: rollback must reset pending-invalidation state ----
+
+    public function test_invalidation_still_works_after_a_rollback()
+    {
+        $this->assertSame(10.0, $this->price(1)); // caches 10
+
+        // A rolled-back write schedules (then discards) an invalidation for
+        // fix_products; the bookkeeping must be reset with it.
+        $this->connection->beginTransaction();
+        $this->connection->update('UPDATE fix_products SET price = ? WHERE id = ?', [77.00, 1]);
+        $this->connection->rollBack();
+
+        $this->assertSame(10.0, $this->price(1));
+
+        // A later committed write on the same table must still invalidate —
+        // a stale "already scheduled" flag would skip it.
+        $this->connection->beginTransaction();
+        $this->connection->update('UPDATE fix_products SET price = ? WHERE id = ?', [88.00, 1]);
+        $this->connection->commit();
+
+        $this->assertSame(88.0, $this->price(1), 'Invalidation must work in a transaction following a rollback');
+    }
 }

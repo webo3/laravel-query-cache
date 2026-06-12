@@ -57,6 +57,20 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Max Result Size (redis driver only)
+    |--------------------------------------------------------------------------
+    |
+    | Serialized results larger than this many bytes are not written to Redis
+    | (they are still served from the request-level L1 cache). Guards against
+    | a single huge result set blowing Redis memory or adding multi-megabyte
+    | writes to the request that missed. Set to 0 to disable the guard.
+    |
+    */
+
+    'max_result_bytes' => env('DB_QUERY_CACHE_MAX_RESULT_BYTES', 1048576),
+
+    /*
+    |--------------------------------------------------------------------------
     | Enable Logging
     |--------------------------------------------------------------------------
     |

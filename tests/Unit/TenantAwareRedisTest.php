@@ -69,11 +69,11 @@ class TenantAwareRedisTest extends TestCase
         $this->driver->put('key1', ['data'], 'SELECT * FROM users', microtime(true));
 
         // Verify key is tracked in tenant-scoped set
-        $keysInTenantSet = $this->redis->smembers('db_cache:t:tenant_1:keys');
+        $keysInTenantSet = $this->redis->smembers($this->setKey('db_cache:t:tenant_1:keys'));
         $this->assertContains('key1', $keysInTenantSet);
 
         // Verify key is NOT in the default (non-tenant) set
-        $keysInDefaultSet = $this->redis->smembers('db_cache:keys');
+        $keysInDefaultSet = $this->redis->smembers($this->setKey('db_cache:keys'));
         $this->assertNotContains('key1', $keysInDefaultSet);
     }
 
@@ -87,11 +87,11 @@ class TenantAwareRedisTest extends TestCase
         $this->driver->put($uniqueKey, ['data'], 'SELECT * FROM users WHERE id = 1', microtime(true));
 
         // Verify table index is tenant-scoped
-        $keysInTenantIndex = $this->redis->smembers('db_cache:t:tenant_1:table:users');
+        $keysInTenantIndex = $this->redis->smembers($this->setKey('db_cache:t:tenant_1:table:users'));
         $this->assertContains($uniqueKey, $keysInTenantIndex);
 
         // Verify NOT in the default table index
-        $keysInDefaultIndex = $this->redis->smembers('db_cache:table:users');
+        $keysInDefaultIndex = $this->redis->smembers($this->setKey('db_cache:table:users'));
         $this->assertNotContains($uniqueKey, $keysInDefaultIndex);
     }
 
@@ -245,13 +245,21 @@ class TenantAwareRedisTest extends TestCase
         $this->assertEquals(['data'], $cached['result']);
 
         // Keys should be in default namespace
-        $keysInDefaultSet = $this->redis->smembers('db_cache:keys');
+        $keysInDefaultSet = $this->redis->smembers($this->setKey('db_cache:keys'));
         $this->assertContains('key1', $keysInDefaultSet);
     }
 
     /**
      * Build full Redis key with Laravel prefix
      */
+    private function setKey(string $logical): string
+    {
+        $appName = config('app.name', 'laravel');
+        $appSlug = \Illuminate\Support\Str::slug($appName, '_');
+        $cachePrefix = config('cache.prefix');
+        return "{$appSlug}_database_{$cachePrefix}:{$logical}";
+    }
+
     private function buildFullKey(string $key, ?string $tenantId = null): string
     {
         $appName = config('app.name', 'laravel');

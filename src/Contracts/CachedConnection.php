@@ -23,5 +23,7 @@ interface CachedConnection
 
     public function flushRequestCache(): void;
 
+    public function pruneQueryCache(): int;
+
     public function setExcludedTables(array $tables): void;
 }

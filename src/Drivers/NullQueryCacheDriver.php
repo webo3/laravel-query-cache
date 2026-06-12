@@ -104,4 +104,12 @@ class NullQueryCacheDriver implements QueryCacheDriver
     {
         // No-op
     }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function pruneExpired(): int
+    {
+        return 0;
+    }
 }

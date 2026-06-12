@@ -33,6 +33,13 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
     private ?string $tenantId = null;
 
     /**
+     * Per-request hit/miss counters for getStats().
+     */
+    private int $requestHits = 0;
+
+    private int $requestMisses = 0;
+
+    /**
      * Configuration
      */
     private array $config;
@@ -44,16 +51,48 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
     {
         $this->config = array_merge([
             'max_size' => 1000,
+            'ttl' => 300,
             'log_enabled' => false,
         ], $config);
     }
 
     /**
      * {@inheritDoc}
+     *
+     * Entries older than the configured ttl are expired on read: a request
+     * (or long-running job between flush boundaries) must not serve entries
+     * past the staleness bound the user configured.
      */
     public function get(string $key): ?array
     {
-        return self::$cache[$key] ?? null;
+        $entry = self::$cache[$key] ?? null;
+
+        if ($entry === null) {
+            $this->requestMisses++;
+
+            return null;
+        }
+
+        if ($this->isExpired($entry)) {
+            $this->forget($key);
+            $this->requestMisses++;
+
+            return null;
+        }
+
+        $this->requestHits++;
+
+        return $entry;
+    }
+
+    /**
+     * Whether a cache entry has outlived the configured ttl.
+     */
+    private function isExpired(array $entry): bool
+    {
+        $ttl = (int) $this->config['ttl'];
+
+        return $ttl > 0 && (microtime(true) - ($entry['cached_at'] ?? 0)) > $ttl;
     }
 
     /**
@@ -72,6 +111,7 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
             'tables' => $tables,
             'query' => $query,
             'executed_at' => $executedAt,
+            'cached_at' => microtime(true),
             'hits' => 0
         ];
 
@@ -185,6 +225,8 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
             'driver' => 'array',
             'cached_queries_count' => count(self::$cache),
             'total_cache_hits' => $totalHits,
+            'request_hits' => $this->requestHits,
+            'request_misses' => $this->requestMisses,
             'queries' => $queries
         ];
     }
@@ -228,13 +270,39 @@ class ArrayQueryCacheDriver implements QueryCacheDriver
      * {@inheritDoc}
      *
      * The array driver IS the L1 cache — flushing per-request state means
-     * dropping all cached entries and the inverted table index.
+     * dropping all cached entries and the inverted table index. The tenant
+     * context is reset too: driver instances persist across requests under
+     * Octane/queue workers, and a stale tenant context would defeat the
+     * tenant_required fail-safe for the next request.
      */
     public function flushRequestCache(): void
     {
         self::$cache = [];
         self::$tableIndex = [];
+        $this->tenantId = null;
+        $this->requestHits = 0;
+        $this->requestMisses = 0;
         SqlTableExtractor::resetCache();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * Drops entries whose ttl has elapsed (the array driver has no background
+     * expiry, so this is the only reclamation outside eviction/invalidation).
+     */
+    public function pruneExpired(): int
+    {
+        $removed = 0;
+
+        foreach (array_keys(self::$cache) as $key) {
+            if ($this->isExpired(self::$cache[$key])) {
+                $this->forget($key);
+                $removed++;
+            }
+        }
+
+        return $removed;
     }
 
     /**

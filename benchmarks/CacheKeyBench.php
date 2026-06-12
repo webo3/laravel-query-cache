@@ -53,9 +53,9 @@ class CacheKeyBench
     public function benchHashingOnly(): void
     {
         // Pre-normalized strings to isolate hashing cost
-        $raw = 'SELECT * FROM USERS WHERE ID = ?[42]';
+        $raw = 'SELECT * FROM users WHERE id = ?[42]';
         if (function_exists('hash')) {
-            hash('xxh128', $raw);
+            hash('sha256', $raw);
         } else {
             md5($raw);
         }
@@ -67,7 +67,7 @@ class CacheKeyBench
         $raw = $normalized . json_encode($bindings);
 
         if (function_exists('hash')) {
-            return hash('xxh128', $raw);
+            return hash('sha256', $raw);
         }
 
         return md5($raw);
@@ -79,7 +79,9 @@ class CacheKeyBench
             return self::$normalizedCache[$query];
         }
 
-        $normalized = preg_replace('/\s+/', ' ', strtoupper(trim($query)));
+        // Whitespace-only normalization: case is preserved (folding identifier
+        // case aliased distinct tables on case-sensitive systems).
+        $normalized = preg_replace('/\s+/', ' ', trim($query));
         self::$normalizedCache[$query] = $normalized;
 
         return $normalized;

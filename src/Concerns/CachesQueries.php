@@ -43,6 +43,20 @@ trait CachesQueries
     private static array $normalizedQueryCache = [];
 
     /**
+     * Tables with an invalidation already scheduled for the current
+     * transaction's commit (table name => true). Lets a bulk import of N
+     * statements schedule one invalidation per distinct table instead of one
+     * per statement.
+     */
+    private array $txPendingTables = [];
+
+    /**
+     * Whether a full-cache purge is already scheduled for the current
+     * transaction's commit (a mutation whose tables could not be determined).
+     */
+    private bool $txPendingFlushAll = false;
+
+    /**
      * Initialize the caching subsystem. Must be called from the
      * connection class constructor after parent::__construct().
      */
@@ -65,12 +79,26 @@ trait CachesQueries
      */
     public function cursor($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
     {
-        $this->inCursorQuery = true;
+        $inner = parent::cursor($query, $bindings, $useReadPdo, $fetchUsing);
 
+        // The inner generator's first advance executes parent::run() for the
+        // cursor's own SELECT; hold the flag up only for that window.
+        $this->inCursorQuery = true;
         try {
-            yield from parent::cursor($query, $bindings, $useReadPdo, $fetchUsing);
+            $valid = $inner->valid();
         } finally {
             $this->inCursorQuery = false;
+        }
+
+        // Stream rows with the flag down: queries issued from inside the
+        // consuming loop must hit the normal cache/invalidation paths. Holding
+        // the flag for the generator's whole lifetime (the old behavior)
+        // silently skipped invalidation for mutations executed while iterating.
+        while ($valid) {
+            yield $inner->key() => $inner->current();
+
+            $inner->next();
+            $valid = $inner->valid();
         }
     }
 
@@ -86,8 +114,11 @@ trait CachesQueries
      */
     protected function run($query, $bindings, Closure $callback)
     {
-        // Never cache cursor queries - they're designed for memory-efficient streaming
-        if ($this->inCursorQuery) {
+        // Never cache cursor queries - they're designed for memory-efficient streaming.
+        // Never touch the cache while pretending: pretended SELECT callbacks
+        // return [] without executing (caching that would poison the key for
+        // real callers), and pretended mutations must not invalidate anything.
+        if ($this->inCursorQuery || $this->pretending()) {
             return parent::run($query, $bindings, $callback);
         }
 
@@ -116,6 +147,21 @@ trait CachesQueries
             // MODE): a cache hit would skip the row lock the statement exists to
             // acquire and could return stale rows.
             if ($this->isLockingRead($query)) {
+                return parent::run($query, $bindings, $callback);
+            }
+
+            // Never cache SELECT ... INTO: on Postgres it creates a table, on
+            // MySQL it writes a file/variable — a cache hit would silently skip
+            // the side effect.
+            if ($this->isSelectInto($query)) {
+                return parent::run($query, $bindings, $callback);
+            }
+
+            // Never cache queries calling nondeterministic or side-effecting
+            // functions (NOW(), RAND(), UUID(), nextval(), ...): serving a
+            // cached value changes their semantics — nextval() in particular
+            // would hand the same sequence value to multiple callers.
+            if ($this->isNonDeterministicQuery($query)) {
                 return parent::run($query, $bindings, $callback);
             }
 
@@ -232,8 +278,11 @@ trait CachesQueries
         // UTF-8, which would collapse the bindings and alias unrelated queries.
         $raw = $this->getName() . "\0" . $normalizedQuery . "\0" . serialize($bindings);
 
-        // xxh128 (PHP 8.1+) — ~5-10x faster than md5.
-        return hash('xxh128', $raw);
+        // sha256, not a fast non-cryptographic hash: bindings are
+        // user-influenced, and a crafted collision on a shared cache would
+        // serve one query's rows to another. The hash cost is noise next to
+        // the network round-trip it guards.
+        return hash('sha256', $raw);
     }
 
     /**
@@ -249,16 +298,23 @@ trait CachesQueries
             return self::$normalizedQueryCache[$query];
         }
 
+        // Cap the memo so long-running CLI jobs emitting many distinct SQL
+        // shapes can't grow it without bound.
+        if (count(self::$normalizedQueryCache) >= 5000) {
+            self::$normalizedQueryCache = [];
+        }
+
         return self::$normalizedQueryCache[$query] = $this->normalizeStructure($query);
     }
 
     /**
-     * Upper-case keywords/identifiers and collapse runs of whitespace, but
-     * leave the contents of quoted string literals and quoted identifiers
-     * untouched. This keeps caching case-/whitespace-insensitive for the query
-     * structure while ensuring two raw queries that differ only by a literal's
-     * case or internal spacing (e.g. 'Active' vs 'ACTIVE') hash to different
-     * keys instead of colliding.
+     * Collapse runs of whitespace outside quoted regions, leaving the contents
+     * of string literals and quoted identifiers untouched. Identifier/keyword
+     * case is intentionally preserved: on case-sensitive systems (MySQL with
+     * lower_case_table_names=0) `FROM Users` and `FROM users` are different
+     * tables, and folding case would alias them to one cache key — a collision
+     * serving the wrong table's rows. Whitespace-only normalization keeps the
+     * key stable across formatting differences without that risk.
      *
      * @param string $sql
      * @return string
@@ -308,7 +364,7 @@ trait CachesQueries
                 $out .= ' ';
             }
             $pendingSpace = false;
-            $out .= strtoupper($ch);
+            $out .= $ch;
         }
 
         return $out;
@@ -334,7 +390,7 @@ trait CachesQueries
             return 'SELECT';
         }
 
-        if (preg_match('/^\s*(INSERT|UPDATE|DELETE|TRUNCATE|REPLACE|ALTER|DROP|CREATE|RENAME|MERGE|CALL|EXEC|EXECUTE)\b/i', $sql)) {
+        if (preg_match('/^\s*(INSERT|UPDATE|DELETE|TRUNCATE|REPLACE|ALTER|DROP|CREATE|RENAME|MERGE|CALL|EXEC|EXECUTE|LOAD|COPY)\b/i', $sql)) {
             return 'MUTATION';
         }
 
@@ -401,27 +457,135 @@ trait CachesQueries
     }
 
     /**
+     * Detect SELECT ... INTO (table / OUTFILE / DUMPFILE / @variable) — a
+     * SELECT with a side effect that a cache hit would skip. A false positive
+     * (the word INTO inside a string literal) only bypasses caching, which is
+     * the safe direction.
+     *
+     * @param string $sql
+     * @return bool
+     */
+    private function isSelectInto(string $sql): bool
+    {
+        return preg_match('/\bINTO\b/i', $sql) === 1;
+    }
+
+    /**
+     * Detect calls to nondeterministic or side-effecting SQL functions whose
+     * results must never be served from cache. Covers MySQL and Postgres
+     * time/random/uuid/sequence/session functions. A false positive (a match
+     * inside a string literal) only bypasses caching — the safe direction.
+     *
+     * @param string $sql
+     * @return bool
+     */
+    private function isNonDeterministicQuery(string $sql): bool
+    {
+        return preg_match(
+            '/\b(?:NOW|SYSDATE|CURDATE|CURTIME|UNIX_TIMESTAMP|UTC_DATE|UTC_TIME|UTC_TIMESTAMP'
+            . '|RAND|RANDOM|UUID|UUID_SHORT|GEN_RANDOM_UUID'
+            . '|NEXTVAL|CURRVAL|LASTVAL|SETVAL|LAST_INSERT_ID'
+            . '|ROW_COUNT|FOUND_ROWS|CONNECTION_ID|PG_BACKEND_PID'
+            . '|CLOCK_TIMESTAMP|STATEMENT_TIMESTAMP|TRANSACTION_TIMESTAMP|TIMEOFDAY)\s*\(/i',
+            $sql
+        ) === 1
+            || preg_match('/\bCURRENT_(?:DATE|TIME|TIMESTAMP)\b|\bLOCALTIME(?:STAMP)?\b/i', $sql) === 1;
+    }
+
+    /**
      * Invalidate the cache for a mutation, deferring to the commit boundary
      * when inside a transaction so the purge can't be repopulated with
      * pre-commit data and is discarded if the transaction rolls back.
+     *
+     * Invalidations are aggregated per distinct table for the duration of the
+     * transaction: a bulk import of 10k statements against one table schedules
+     * a single commit-time invalidation, not 10k.
      *
      * @param string $query
      * @return void
      */
     private function scheduleInvalidation(string $query): void
     {
-        if ($this->transactionLevel() > 0) {
-            try {
-                $this->afterCommit(fn () => $this->invalidateCache($query));
+        if ($this->transactionLevel() === 0) {
+            $this->invalidateCache($query);
 
-                return;
+            return;
+        }
+
+        // A full-cache purge already scheduled for this commit supersedes
+        // anything more granular.
+        if ($this->txPendingFlushAll) {
+            return;
+        }
+
+        $tables = SqlTableExtractor::extract($query);
+
+        if (empty($tables)) {
+            try {
+                $this->afterCommit(function () use ($query) {
+                    $this->txPendingFlushAll = false;
+                    $this->txPendingTables = [];
+                    $this->cacheDriver->invalidateTables([], $query);
+                });
             } catch (\RuntimeException $e) {
                 // No transactions manager bound (e.g. a bare connection):
                 // fall back to immediate invalidation.
+                $this->invalidateCache($query);
+
+                return;
             }
+
+            $this->txPendingFlushAll = true;
+
+            return;
         }
 
-        $this->invalidateCache($query);
+        $newTables = array_values(array_filter(
+            $tables,
+            fn ($table) => !isset($this->txPendingTables[$table])
+        ));
+
+        if (empty($newTables)) {
+            return; // every affected table already has an invalidation scheduled
+        }
+
+        try {
+            $this->afterCommit(function () use ($newTables, $query) {
+                foreach ($newTables as $table) {
+                    unset($this->txPendingTables[$table]);
+                }
+                $this->cacheDriver->invalidateTables($newTables, $query);
+            });
+        } catch (\RuntimeException $e) {
+            $this->invalidateCache($query);
+
+            return;
+        }
+
+        foreach ($newTables as $table) {
+            $this->txPendingTables[$table] = true;
+        }
+    }
+
+    /**
+     * Roll back the active transaction, then drop the pending-invalidation
+     * bookkeeping. The transactions manager discards afterCommit callbacks
+     * registered inside the rolled-back scope; without this reset a later
+     * mutation on the same table would be skipped as "already scheduled" and
+     * its invalidation lost. Worst case after the reset is a duplicate
+     * invalidation — never a missed one.
+     *
+     * @param  int|null  $toLevel
+     * @return void
+     */
+    public function rollBack($toLevel = null)
+    {
+        try {
+            parent::rollBack($toLevel);
+        } finally {
+            $this->txPendingTables = [];
+            $this->txPendingFlushAll = false;
+        }
     }
 
     /**
@@ -597,6 +761,24 @@ trait CachesQueries
     {
         $this->cacheDriver->flushRequestCache();
         self::$normalizedQueryCache = [];
+
+        // Tenant context must not leak across request/job boundaries in
+        // long-running runtimes (Octane, queue workers): without this reset
+        // the tenant_required fail-safe only protects a worker's first
+        // request, and a forgotten setTenantContext() on a later request
+        // would silently read the previous tenant's cache.
+        $this->tenantContextSet = false;
+    }
+
+    /**
+     * Reconcile the cache's bookkeeping with expired entries (Redis driver:
+     * remove tracking-set/index members whose data hash has expired).
+     *
+     * @return int Number of stale references removed
+     */
+    public function pruneQueryCache(): int
+    {
+        return $this->cacheDriver->pruneExpired();
     }
 
     /**

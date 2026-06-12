@@ -2,9 +2,10 @@
 
 namespace webO3\LaravelDbCache;
 
-use Illuminate\Support\Arr;
 use Illuminate\Support\ServiceProvider;
 use webO3\LaravelDbCache\Console\ClearQueryCacheCommand;
+use webO3\LaravelDbCache\Console\PruneQueryCacheCommand;
+use webO3\LaravelDbCache\Support\ConfigList;
 
 class QueryCacheServiceProvider extends ServiceProvider
 {
@@ -34,18 +35,14 @@ class QueryCacheServiceProvider extends ServiceProvider
 
             $this->commands([
                 ClearQueryCacheCommand::class,
+                PruneQueryCacheCommand::class,
             ]);
         }
 
         // Inject db_cache config into the database connection config
         if (config('db-cache.enabled', false)) {
-            $raw = config('db-cache.connection', 'mysql');
-            $connections = is_string($raw) ? array_map('trim', explode(',', $raw)) : Arr::wrap($raw);
-
-            $excludedRaw = config('db-cache.excluded_tables', []);
-            $excludedTables = is_string($excludedRaw)
-                ? array_filter(array_map('trim', explode(',', $excludedRaw)))
-                : Arr::wrap($excludedRaw);
+            $connections = ConfigList::cachedConnections();
+            $excludedTables = ConfigList::parse(config('db-cache.excluded_tables', []));
 
             foreach ($connections as $connection) {
                 config([
@@ -54,6 +51,7 @@ class QueryCacheServiceProvider extends ServiceProvider
                         'driver' => config('db-cache.driver', 'array'),
                         'ttl' => config('db-cache.ttl', 180),
                         'max_size' => config('db-cache.max_size', 1000),
+                        'max_result_bytes' => config('db-cache.max_result_bytes', 1048576),
                         'log_enabled' => config('db-cache.log_enabled', false),
                         'redis_connection' => config('db-cache.redis_connection', 'db_cache'),
                         'excluded_tables' => $excludedTables,
@@ -67,10 +65,11 @@ class QueryCacheServiceProvider extends ServiceProvider
     }
 
     /**
-     * Register listeners that flush the per-request L1 cache on request /
-     * job / Octane request boundaries. Without these, long-running workers
-     * (Horizon, FrankenPHP via Octane) accumulate stale L1 entries that
-     * outlive their intended TTL.
+     * Register hooks that flush the per-request L1 cache (and tenant context)
+     * on request / job / Octane request boundaries. Without these, long-running
+     * workers (Horizon, FrankenPHP via Octane) accumulate stale L1 entries that
+     * outlive their intended TTL — and carry one request's tenant context into
+     * the next.
      */
     private function registerLifecycleListeners(array $connections): void
     {
@@ -87,9 +86,14 @@ class QueryCacheServiceProvider extends ServiceProvider
             }
         };
 
-        $events = $this->app['events'];
+        // Requests: flush via the container's terminating callbacks, which the
+        // HTTP kernel runs AFTER terminable middleware — so the stats
+        // middleware's terminate() still sees this request's counters before
+        // they are reset. (A RequestHandled listener would fire before
+        // terminate() and zero the stats first.)
+        $this->app->terminating($flush);
 
-        $events->listen(\Illuminate\Foundation\Http\Events\RequestHandled::class, $flush);
+        $events = $this->app['events'];
 
         $events->listen(\Illuminate\Queue\Events\JobProcessed::class, $flush);
         $events->listen(\Illuminate\Queue\Events\JobFailed::class, $flush);

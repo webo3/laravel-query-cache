@@ -16,29 +16,36 @@ use Illuminate\Support\Facades\Redis;
  * - Redis Hash structure with pipelining for batch operations
  * - AWS/Valkey compatible (uses Redis Sets instead of KEYS/SCAN)
  * - Automatic serialization with igbinary and compression support
+ * - HMAC-authenticated payloads (no unserialization of unauthenticated data)
  */
 class RedisQueryCacheDriver implements QueryCacheDriver
 {
     /**
-     * Redis Set key to track all cached query keys
-     * Dynamically prefixed with tenant context when set
+     * Redis Set key to track all cached query keys.
+     * Built by applyTenantNamespace() — carries the app/cache prefix and the
+     * tenant namespace when one is set.
      */
-    private string $keysSet = 'db_cache:keys';
+    private string $keysSet;
 
     /**
      * Redis Set key prefix for table-based index (inverted index)
-     * Format: db_cache:table:{table_name} -> Set of query cache keys
-     * Dynamically prefixed with tenant context when set
+     * Format: {prefix}db_cache:table:{table_name} -> Set of query cache keys
      */
-    private string $tableIndexPrefix = 'db_cache:table:';
+    private string $tableIndexPrefix;
 
     /**
      * Redis Set tracking every table that has an index, so flush can iterate
      * without SCAN. SCAN returns raw (client-prefixed) keys which can't be
      * round-tripped back through the Redis client without double-prefixing.
-     * Dynamically prefixed with tenant context when set.
      */
-    private string $tablesSet = 'db_cache:tables';
+    private string $tablesSet;
+
+    /**
+     * Redis Set registering every tenant ID that has ever had a namespace on
+     * this cache, so flush-all and prune can iterate tenant namespaces.
+     * Never tenant-prefixed itself.
+     */
+    private string $tenantsSet;
 
     /**
      * Current tenant ID for cache isolation
@@ -46,20 +53,47 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     private ?string $tenantId = null;
 
     /**
+     * Tenant IDs already registered in the tenant Set this process, so a
+     * per-request setTenantContext() doesn't cost a Redis round-trip each time.
+     */
+    private static array $registeredTenants = [];
+
+    /**
      * Configuration
      */
     private array $config;
 
     /**
-     * Direct Redis connection for Hash operations and pipelining
+     * Direct Redis connection for Hash operations and pipelining.
+     * Resolved lazily so a missing/unreachable Redis configuration degrades to
+     * "no caching" (via the circuit breaker) instead of throwing while the
+     * database connection itself is being constructed.
      */
-    private $redis;
+    private $redis = null;
 
     /**
      * L1 cache: Request-level in-memory cache
      * Prevents repeated Redis calls for the same query within a single HTTP request
      */
     private array $requestCache = [];
+
+    /**
+     * Inverted table index for the L1 cache (table => [key => true]).
+     * Invalidation must be able to purge L1 entries even when Redis (and its
+     * authoritative index) is unreachable — otherwise an entry cached while
+     * the circuit breaker is open would serve stale rows after a same-request
+     * mutation.
+     */
+    private array $l1TableIndex = [];
+
+    /**
+     * Per-request hit/miss counters, reset at request boundaries. These feed
+     * getStats() so the stats middleware can report an honest per-request hit
+     * rate instead of mixing lifetime hit counters with key counts.
+     */
+    private int $requestHits = 0;
+
+    private int $requestMisses = 0;
 
     /**
      * Circuit breaker: timestamp (microtime) until which Redis is considered
@@ -75,11 +109,22 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     private const CIRCUIT_COOLDOWN_SECONDS = 5;
 
     /**
+     * Maximum number of commands per pipeline so a large invalidation can't
+     * buffer an unbounded burst against Redis in one shot.
+     */
+    private const PIPELINE_CHUNK = 500;
+
+    /**
      * Cached data-key prefix ("{appSlug}_database_{cachePrefix}:"), computed
      * once instead of resolving config + slugifying on every key build (which
      * happened per-key inside the pipelined stats/delete loops).
      */
     private string $keyPrefix;
+
+    /**
+     * HMAC key for payload authentication, derived from app.key.
+     */
+    private string $hmacKey;
 
     /**
      * Constructor
@@ -90,33 +135,137 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'ttl' => 300, // 5 minutes default
             'log_enabled' => false,
             'redis_connection' => 'db_cache',
+            'max_result_bytes' => 1048576, // 1 MiB — skip L2 for larger results
         ], $config);
 
         $appSlug = \Illuminate\Support\Str::slug(config('app.name', 'laravel'), '_');
         $cachePrefix = config('cache.prefix');
         $this->keyPrefix = "{$appSlug}_database_{$cachePrefix}:";
 
-        // Get direct Redis connection
-        $redisConnectionName = $this->config['redis_connection'];
-        $this->redis = Redis::connection($redisConnectionName);
+        $appKey = (string) config('app.key');
+        if (str_starts_with($appKey, 'base64:')) {
+            $decoded = base64_decode(substr($appKey, 7), true);
+            $appKey = $decoded === false ? $appKey : $decoded;
+        }
+        $this->hmacKey = $appKey;
+
+        $this->tenantsSet = $this->keyPrefix . 'db_cache:tenants';
+        $this->applyTenantNamespace(null);
+    }
+
+    /**
+     * Resolve the Redis connection lazily. Failures surface as exceptions in
+     * the calling op's try/catch and trip the circuit breaker.
+     */
+    private function redis()
+    {
+        return $this->redis ??= Redis::connection($this->config['redis_connection']);
+    }
+
+    /**
+     * Point the tracking-set names at the given tenant namespace (or the
+     * default namespace for null). All set keys carry the same app/cache
+     * prefix as the data keys, so two apps sharing a Redis database can never
+     * share (and mutually destroy) each other's indexes.
+     */
+    private function applyTenantNamespace(?string $tenantId): void
+    {
+        $this->tenantId = $tenantId;
+
+        if ($tenantId === null) {
+            $this->keysSet = $this->keyPrefix . 'db_cache:keys';
+            $this->tableIndexPrefix = $this->keyPrefix . 'db_cache:table:';
+            $this->tablesSet = $this->keyPrefix . 'db_cache:tables';
+
+            return;
+        }
+
+        $this->keysSet = $this->keyPrefix . "db_cache:t:{$tenantId}:keys";
+        $this->tableIndexPrefix = $this->keyPrefix . "db_cache:t:{$tenantId}:table:";
+        $this->tablesSet = $this->keyPrefix . "db_cache:t:{$tenantId}:tables";
+    }
+
+    /**
+     * Run a callback against another tenant's namespace, restoring the
+     * current one afterwards.
+     */
+    private function withTenantNamespace(?string $tenantId, callable $fn): mixed
+    {
+        $saved = [$this->tenantId, $this->keysSet, $this->tableIndexPrefix, $this->tablesSet];
+
+        $this->applyTenantNamespace($tenantId);
+
+        try {
+            return $fn();
+        } finally {
+            [$this->tenantId, $this->keysSet, $this->tableIndexPrefix, $this->tablesSet] = $saved;
+        }
     }
 
     /**
      * {@inheritDoc}
+     *
+     * @throws \InvalidArgumentException When the tenant ID contains characters
+     *         that could collide with the Redis key namespace structure.
      */
     public function setTenantContext(string $tenantId): void
     {
+        // The ID is embedded verbatim in Redis key names; reject separators
+        // (':' in particular) that would let one crafted ID overlap another
+        // tenant's namespace.
+        if (!preg_match('/^[A-Za-z0-9._-]+$/', $tenantId)) {
+            throw new \InvalidArgumentException(
+                "Query Cache: invalid tenant ID [{$tenantId}] — only letters, digits, '.', '_' and '-' are allowed."
+            );
+        }
+
         if ($this->tenantId === $tenantId) {
             return;
         }
 
-        $this->tenantId = $tenantId;
-        $this->keysSet = "db_cache:t:{$tenantId}:keys";
-        $this->tableIndexPrefix = "db_cache:t:{$tenantId}:table:";
-        $this->tablesSet = "db_cache:t:{$tenantId}:tables";
+        $this->applyTenantNamespace($tenantId);
 
         // Flush L1 cache on tenant switch to prevent cross-tenant leakage
-        $this->requestCache = [];
+        $this->l1Flush();
+
+        $this->registerTenant($tenantId);
+    }
+
+    /**
+     * Record the tenant ID in the tenant registry Set (best-effort) so
+     * flush-all / prune can enumerate tenant namespaces. Memoized per process.
+     */
+    private function registerTenant(string $tenantId): void
+    {
+        if (isset(self::$registeredTenants[$tenantId]) || $this->circuitOpen()) {
+            return;
+        }
+
+        try {
+            $this->redis()->sadd($this->tenantsSet, $tenantId);
+            self::$registeredTenants[$tenantId] = true;
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'registerTenant');
+        }
+    }
+
+    /**
+     * Tenant IDs known to the registry Set.
+     */
+    private function getRegisteredTenants(): array
+    {
+        if ($this->circuitOpen()) {
+            return [];
+        }
+
+        try {
+            return $this->redis()->smembers($this->tenantsSet) ?: [];
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'getRegisteredTenants');
+
+            return [];
+        }
     }
 
     /**
@@ -142,46 +291,66 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     /**
      * Serialize a result for storage.
      *
-     * Every payload carries an explicit 2-char format marker (IB/IZ/PS/PZ) so
-     * the reader decodes by marker instead of guessing — guessing broke when
-     * igbinary availability differed between the writer and a reader, and the
-     * old 'i:'/'c:' markers could fatally call an undefined function.
+     * The body carries an explicit 2-char format marker (IB/IZ/PS/PZ) so the
+     * reader decodes by marker instead of guessing:
      *
      *   IB = igbinary, raw          IZ = igbinary + gzip
      *   PS = php serialize, raw     PZ = php serialize + gzip
+     *
+     * The stored payload is 'S1' + HMAC-SHA256(body) + body: any payload that
+     * fails authentication is rejected *before* unserialization, so an
+     * attacker with Redis write access can never reach PHP unserialization.
+     * This matters most for igbinary, which (unlike unserialize()) has no
+     * allowed_classes filter to deny object-injection gadgets.
      */
     private function serializeResult(mixed $result): string
     {
         if (function_exists('igbinary_serialize')) {
             $serialized = \igbinary_serialize($result);
 
-            return strlen($serialized) > self::COMPRESS_THRESHOLD
+            $body = strlen($serialized) > self::COMPRESS_THRESHOLD
                 ? 'IZ' . \gzcompress($serialized, 6)
                 : 'IB' . $serialized;
+        } else {
+            $serialized = serialize($result);
+
+            $body = strlen($serialized) > self::COMPRESS_THRESHOLD
+                ? 'PZ' . \gzcompress($serialized, 6)
+                : 'PS' . $serialized;
         }
 
-        $serialized = serialize($result);
-
-        return strlen($serialized) > self::COMPRESS_THRESHOLD
-            ? 'PZ' . \gzcompress($serialized, 6)
-            : 'PS' . $serialized;
+        return 'S1' . hash_hmac('sha256', $body, $this->hmacKey, true) . $body;
     }
 
     /**
-     * Decode a stored payload strictly by its format marker.
+     * Decode a stored payload: authenticate the HMAC, then decode strictly by
+     * the format marker.
      *
-     * Throws on any unreadable payload (unknown/legacy marker, missing igbinary
-     * extension, corrupt gzip, corrupt serialization) so the caller treats it
-     * as a cache miss and re-populates, rather than returning a wrong value or
-     * fatally erroring on an undefined function. PHP-serialize payloads are
-     * restricted to stdClass (query rows) to deny object-injection gadgets.
+     * Throws on any unreadable payload (failed authentication, unknown/legacy
+     * marker, missing igbinary extension, corrupt gzip, corrupt serialization)
+     * so the caller treats it as a cache miss and re-populates, rather than
+     * returning a wrong value or fatally erroring. PHP-serialize payloads are
+     * additionally restricted to stdClass (query rows) as defense in depth.
      *
      * @throws \RuntimeException
      */
     private function unserializeResult(string $data): mixed
     {
-        $marker = substr($data, 0, 2);
-        $payload = substr($data, 2);
+        // 'S1' + 32 raw HMAC bytes + 2-char marker minimum.
+        if (!str_starts_with($data, 'S1') || strlen($data) < 36) {
+            // Unknown or legacy (pre-HMAC) format — treat as a miss.
+            throw new \RuntimeException('Query Cache (Redis): unknown cache payload format');
+        }
+
+        $mac = substr($data, 2, 32);
+        $body = substr($data, 34);
+
+        if (!hash_equals(hash_hmac('sha256', $body, $this->hmacKey, true), $mac)) {
+            throw new \RuntimeException('Query Cache (Redis): cache payload failed authentication');
+        }
+
+        $marker = substr($body, 0, 2);
+        $payload = substr($body, 2);
 
         switch ($marker) {
             case 'IB':
@@ -206,7 +375,6 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                 return $value;
 
             default:
-                // Unknown or legacy (pre-marker) format — treat as a miss.
                 throw new \RuntimeException('Query Cache (Redis): unknown cache payload format');
         }
     }
@@ -232,11 +400,15 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     {
         // L1 Cache: Check request-level cache first (instant)
         if (isset($this->requestCache[$key])) {
+            $this->requestHits++;
+
             return $this->requestCache[$key];
         }
 
         // Skip Redis entirely while the circuit breaker is open (recent outage).
         if ($this->circuitOpen()) {
+            $this->requestMisses++;
+
             return null;
         }
 
@@ -245,10 +417,12 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         // so it is client-agnostic — and reports a miss.
         try {
             $fullKey = $this->buildFullKey($key);
-            $data = $this->redis->hgetall($fullKey);
+            $data = $this->redis()->hgetall($fullKey);
             $this->closeCircuit();
         } catch (\Throwable $e) {
             $this->tripCircuit($e, 'get');
+            $this->requestMisses++;
+
             return null;
         }
 
@@ -259,6 +433,8 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         // sticky null. Missing instead makes the query re-run and put()
         // rewrite a complete entry with a fresh TTL (self-healing).
         if (empty($data) || !isset($data['result'])) {
+            $this->requestMisses++;
+
             return null;
         }
 
@@ -282,11 +458,23 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                     'error' => $e->getMessage(),
                 ]);
             }
+            $this->requestMisses++;
+
             return null;
         }
 
+        // The L1 inverted index needs the table list; reconstruct it from the
+        // query when the stored field is missing so local invalidation works.
+        if (!is_array($cached['tables'])) {
+            $cached['tables'] = $cached['query'] !== ''
+                ? SqlTableExtractor::extract($cached['query'])
+                : [];
+        }
+
         // Store in L1 cache for this request
-        $this->requestCache[$key] = $cached;
+        $this->l1Put($key, $cached);
+
+        $this->requestHits++;
 
         return $cached;
     }
@@ -309,7 +497,7 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         $this->circuitOpenUntil = microtime(true) + self::CIRCUIT_COOLDOWN_SECONDS;
 
         if (!$alreadyOpen) {
-            Log::error('Query Cache (Redis): connection/timeout error — skipping cache for ' . self::CIRCUIT_COOLDOWN_SECONDS . 's', [
+            Log::error('Query Cache (Redis): connection/timeout error — skipping cache reads, writes and L2 invalidation for ' . self::CIRCUIT_COOLDOWN_SECONDS . 's', [
                 'op' => $op,
                 'error' => $e->getMessage(),
             ]);
@@ -327,6 +515,57 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     }
 
     /**
+     * Store an entry in the L1 cache and its inverted table index.
+     */
+    private function l1Put(string $key, array $entry): void
+    {
+        $this->requestCache[$key] = $entry;
+
+        foreach (($entry['tables'] ?? []) ?: [] as $table) {
+            $this->l1TableIndex[$table][$key] = true;
+        }
+    }
+
+    /**
+     * Remove an entry from the L1 cache and its inverted table index.
+     */
+    private function l1Forget(string $key): void
+    {
+        $tables = $this->requestCache[$key]['tables'] ?? [];
+
+        unset($this->requestCache[$key]);
+
+        foreach ((array) $tables as $table) {
+            unset($this->l1TableIndex[$table][$key]);
+            if (empty($this->l1TableIndex[$table])) {
+                unset($this->l1TableIndex[$table]);
+            }
+        }
+    }
+
+    /**
+     * Purge every L1 entry referencing any of the given tables. Runs on plain
+     * PHP arrays so it works even while Redis is unreachable.
+     */
+    private function l1InvalidateTables(array $tables): void
+    {
+        foreach ($tables as $table) {
+            foreach (array_keys($this->l1TableIndex[$table] ?? []) as $key) {
+                $this->l1Forget($key);
+            }
+        }
+    }
+
+    /**
+     * Drop the whole L1 cache and its index.
+     */
+    private function l1Flush(): void
+    {
+        $this->requestCache = [];
+        $this->l1TableIndex = [];
+    }
+
+    /**
      * {@inheritDoc}
      */
     public function put(string $key, mixed $result, string $query, float $executedAt): void
@@ -336,8 +575,9 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         // Extract tables upfront for indexing (required for efficient invalidation)
         $tables = SqlTableExtractor::extract($query);
 
-        // Store in L1 cache immediately (no network overhead)
-        $this->requestCache[$key] = [
+        // Store in L1 cache immediately (no network overhead — the entry holds
+        // a reference to a result that is already in memory this request).
+        $this->l1Put($key, [
             'result' => $result,
             'query' => $query,
             'executed_at' => $executedAt,
@@ -345,18 +585,36 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'hits' => 0,
             'tables' => $tables,
             'last_accessed' => null,
-        ];
+        ]);
 
         // Keep the L1 entry but skip L2 while the breaker is open.
         if ($this->circuitOpen()) {
             return;
         }
 
+        $serialized = $this->serializeResult($result);
+
+        // Oversized results are served from L1 for this request but never
+        // shipped to Redis: one giant result set must not blow Redis memory or
+        // add multi-MB writes to the request that missed.
+        $maxBytes = (int) $this->config['max_result_bytes'];
+        if ($maxBytes > 0 && strlen($serialized) > $maxBytes) {
+            if ($this->config['log_enabled']) {
+                Log::debug('Query Cache (Redis): result exceeds max_result_bytes, skipping L2 cache', [
+                    'key' => $key,
+                    'bytes' => strlen($serialized),
+                    'max_result_bytes' => $maxBytes,
+                ]);
+            }
+
+            return;
+        }
+
         try {
             $fullKey = $this->buildFullKey($key);
-            $serialized = $this->serializeResult($result);
             $tablesJson = json_encode($tables);
             $ttl = $this->ttlWithJitter();
+            $indexTtl = $this->indexTtl();
             $keysSet = $this->keysSet;
             $tablesSet = $this->tablesSet;
             $tableIndexPrefix = $this->tableIndexPrefix;
@@ -365,9 +623,12 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             // membership and every table index together. Doing the index writes
             // inside the same transaction (not afterward) means a crash can
             // never leave a live-but-unindexed key that nothing can invalidate.
+            // The tracking/index sets get their own (longer) TTL, refreshed on
+            // every put: without one, read-mostly tables would accumulate dead
+            // members forever as data hashes expire.
             // (Multi-key MULTI assumes a single Redis node — see README for the
             // Redis Cluster caveat.)
-            $this->redis->transaction(function ($tx) use ($fullKey, $serialized, $query, $executedAt, $now, $tablesJson, $ttl, $key, $keysSet, $tablesSet, $tableIndexPrefix, $tables) {
+            $this->redis()->transaction(function ($tx) use ($fullKey, $serialized, $query, $executedAt, $now, $tablesJson, $ttl, $indexTtl, $key, $keysSet, $tablesSet, $tableIndexPrefix, $tables) {
                 $tx->hmset($fullKey, [
                     'result' => $serialized,
                     'query' => $query,
@@ -378,9 +639,14 @@ class RedisQueryCacheDriver implements QueryCacheDriver
                 ]);
                 $tx->expire($fullKey, $ttl);
                 $tx->sadd($keysSet, $key);
+                $tx->expire($keysSet, $indexTtl);
                 foreach ($tables as $table) {
                     $tx->sadd($tableIndexPrefix . $table, $key);
+                    $tx->expire($tableIndexPrefix . $table, $indexTtl);
                     $tx->sadd($tablesSet, $table);
+                }
+                if (!empty($tables)) {
+                    $tx->expire($tablesSet, $indexTtl);
                 }
             });
 
@@ -407,20 +673,38 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     }
 
     /**
+     * TTL for the tracking/index sets. Refreshed on every put, and always
+     * comfortably longer than the longest possible data-entry TTL (base + 10%
+     * jitter) so an index can never expire while a member's data hash is still
+     * alive — that would orphan a live key and break its invalidation.
+     */
+    private function indexTtl(): int
+    {
+        return max(120, 2 * (int) $this->config['ttl']);
+    }
+
+    /**
      * {@inheritDoc}
      */
     public function has(string $key): bool
     {
+        if (isset($this->requestCache[$key])) {
+            return true;
+        }
+
+        if ($this->circuitOpen()) {
+            return false;
+        }
+
         try {
             $fullKey = $this->buildFullKey($key);
-            return (bool)$this->redis->exists($fullKey);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to check Hash existence', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
-            }
+            $exists = (bool) $this->redis()->exists($fullKey);
+            $this->closeCircuit();
+
+            return $exists;
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'has');
+
             return false;
         }
     }
@@ -430,29 +714,39 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     public function forget(string $key): void
     {
-        // Get tables before removing from L1 cache (needed for index cleanup)
+        // Resolve the entry's table list BEFORE deleting anything: once the
+        // hash is gone its 'tables' field is unreadable and the index cleanup
+        // would silently no-op, leaking index members.
         $tables = $this->requestCache[$key]['tables'] ?? null;
 
-        // Remove from L1 cache
-        unset($this->requestCache[$key]);
+        $this->l1Forget($key);
+
+        if ($this->circuitOpen()) {
+            return;
+        }
 
         try {
             $fullKey = $this->buildFullKey($key);
-            $this->redis->del($fullKey);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to delete Hash', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
+
+            if ($tables === null) {
+                $tablesJson = $this->redis()->hget($fullKey, 'tables');
+                $tables = (is_string($tablesJson) && $tablesJson !== '')
+                    ? (json_decode($tablesJson, true) ?: [])
+                    : [];
             }
+
+            $this->redis()->pipeline(function ($pipe) use ($fullKey, $key, $tables) {
+                $pipe->del($fullKey);
+                $pipe->srem($this->keysSet, $key);
+                foreach ($tables as $table) {
+                    $pipe->srem($this->tableIndexPrefix . $table, $key);
+                }
+            });
+
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'forget');
         }
-
-        // Remove from tracking Set
-        $this->removeKeyFromSet($key);
-
-        // Remove from table indexes
-        $this->removeKeyFromTableIndexes($key, $tables);
     }
 
     /**
@@ -460,6 +754,14 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     public function invalidateTables(array $tables, string $query): int
     {
+        // Purge matching L1 entries unconditionally, before any Redis I/O:
+        // local consistency must survive a Redis outage.
+        if (empty($tables)) {
+            $this->l1Flush();
+        } else {
+            $this->l1InvalidateTables($tables);
+        }
+
         if (empty($tables)) {
             // Clear all query cache
             $this->clearAllTrackedKeys();
@@ -479,14 +781,34 @@ class RedisQueryCacheDriver implements QueryCacheDriver
 
     /**
      * {@inheritDoc}
+     *
+     * Without a tenant context this clears the default namespace AND every
+     * namespace in the tenant registry — "clear the cache" must not silently
+     * leave tenant-namespaced entries alive. With a tenant context set it
+     * clears only that tenant's namespace.
      */
     public function flush(): void
     {
         // Clear L1 cache
-        $this->requestCache = [];
+        $this->l1Flush();
 
-        // Clear L2 cache (Redis)
+        // Clear L2 cache (Redis) for the current namespace
         $this->clearAllTrackedKeys();
+
+        if ($this->tenantId !== null) {
+            return;
+        }
+
+        foreach ($this->getRegisteredTenants() as $tenant) {
+            $this->withTenantNamespace($tenant, fn () => $this->clearAllTrackedKeys());
+        }
+
+        try {
+            $this->redis()->del($this->tenantsSet);
+            self::$registeredTenants = [];
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'flush');
+        }
     }
 
     /**
@@ -498,6 +820,8 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'driver' => 'redis',
             'cached_queries_count' => 0,
             'total_cache_hits' => 0,
+            'request_hits' => $this->requestHits,
+            'request_misses' => $this->requestMisses,
             'queries' => [],
         ];
 
@@ -511,11 +835,17 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         try {
             // Metadata only via HMGET — never pull the (potentially large)
             // 'result' blob just to count/list cached queries.
-            $rows = $this->redis->pipeline(function ($pipe) use ($keys) {
-                foreach ($keys as $key) {
-                    $pipe->hmget($this->buildFullKey($key), ['query', 'tables', 'hits', 'cached_at']);
+            $rows = [];
+            foreach (array_chunk($keys, self::PIPELINE_CHUNK) as $chunk) {
+                $chunkRows = $this->redis()->pipeline(function ($pipe) use ($chunk) {
+                    foreach ($chunk as $key) {
+                        $pipe->hmget($this->buildFullKey($key), ['query', 'tables', 'hits', 'cached_at']);
+                    }
+                });
+                foreach ($chunkRows as $row) {
+                    $rows[] = $row;
                 }
-            });
+            }
             $this->closeCircuit();
         } catch (\Throwable $e) {
             $this->tripCircuit($e, 'getStats');
@@ -572,6 +902,8 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             'driver' => 'redis',
             'cached_queries_count' => count($queries),
             'total_cache_hits' => $totalHits,
+            'request_hits' => $this->requestHits,
+            'request_misses' => $this->requestMisses,
             'queries' => $queries,
         ];
     }
@@ -592,12 +924,18 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             return;
         }
 
+        // Track the hit on the L1 entry locally instead of evicting it:
+        // evicting forced the next identical query back to Redis, effectively
+        // disabling L1 (and doubling Redis traffic) whenever stats logging was
+        // on. The authoritative counter lives in Redis via HINCRBY below.
+        if (isset($this->requestCache[$key])) {
+            $this->requestCache[$key]['hits']++;
+            $this->requestCache[$key]['last_accessed'] = microtime(true);
+        }
+
         if ($this->circuitOpen()) {
             return;
         }
-
-        // Invalidate L1 cache so next get() fetches updated hits from Redis
-        unset($this->requestCache[$key]);
 
         try {
             $fullKey = $this->buildFullKey($key);
@@ -608,7 +946,7 @@ class RedisQueryCacheDriver implements QueryCacheDriver
             // refreshing on every hit let hot keys live forever and serve stale
             // data. HINCRBY can resurrect a just-expired key into a result-less
             // hash; get() guards against that zombie.
-            $this->redis->pipeline(function ($pipe) use ($fullKey, $now) {
+            $this->redis()->pipeline(function ($pipe) use ($fullKey, $now) {
                 $pipe->hincrby($fullKey, 'hits', 1);
                 $pipe->hset($fullKey, 'last_accessed', (string)$now);
             });
@@ -633,29 +971,121 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     public function flushRequestCache(): void
     {
-        $this->requestCache = [];
+        $this->l1Flush();
+        $this->requestHits = 0;
+        $this->requestMisses = 0;
+
+        // Drop the tenant namespace: connection (and driver) instances persist
+        // across requests under Octane/queue workers, and a stale tenant
+        // context would defeat the tenant_required fail-safe for the next
+        // request.
+        $this->applyTenantNamespace(null);
+
         SqlTableExtractor::resetCache();
     }
 
     /**
-     * Remove a key from the tracking Set
+     * {@inheritDoc}
      *
-     * @param string $key
-     * @return void
+     * Walks the tracking Set and every table index, removing members whose
+     * data hash has expired. Without a tenant context, also reconciles every
+     * registered tenant namespace.
      */
-    private function removeKeyFromSet(string $key): void
+    public function pruneExpired(): int
     {
-        try {
-            // Remove from Set using SREM (AWS/Valkey compatible)
-            $this->redis->srem($this->keysSet, $key);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to remove key from tracking set', [
-                    'key' => $key,
-                    'error' => $e->getMessage()
-                ]);
+        $removed = $this->pruneNamespace();
+
+        if ($this->tenantId === null) {
+            foreach ($this->getRegisteredTenants() as $tenant) {
+                $removed += $this->withTenantNamespace($tenant, fn () => $this->pruneNamespace());
             }
         }
+
+        return $removed;
+    }
+
+    /**
+     * Reconcile the current namespace's tracking Set and table indexes against
+     * the keys that still exist. Best-effort: failures trip the breaker and
+     * report 0.
+     */
+    private function pruneNamespace(): int
+    {
+        if ($this->circuitOpen()) {
+            return 0;
+        }
+
+        try {
+            $removed = 0;
+
+            // Tracking Set: drop members whose data hash has expired.
+            $keys = $this->redis()->smembers($this->keysSet) ?: [];
+            foreach (array_chunk($keys, self::PIPELINE_CHUNK) as $chunk) {
+                $dead = $this->missingKeys($chunk);
+                if (!empty($dead)) {
+                    $this->pruneTrackedKeys($dead);
+                    $removed += count($dead);
+                }
+            }
+
+            // Table indexes: drop members whose data hash has expired; drop
+            // the table from the tables Set when its index empties out.
+            $tables = $this->redis()->smembers($this->tablesSet) ?: [];
+            foreach ($tables as $table) {
+                $indexKey = $this->tableIndexPrefix . $table;
+                $members = $this->redis()->smembers($indexKey) ?: [];
+                $deadCount = 0;
+
+                foreach (array_chunk($members, self::PIPELINE_CHUNK) as $chunk) {
+                    $dead = $this->missingKeys($chunk);
+                    if (empty($dead)) {
+                        continue;
+                    }
+                    $this->redis()->pipeline(function ($pipe) use ($indexKey, $dead) {
+                        foreach ($dead as $key) {
+                            $pipe->srem($indexKey, $key);
+                        }
+                    });
+                    $deadCount += count($dead);
+                }
+
+                $removed += $deadCount;
+
+                if ($deadCount > 0 && $deadCount >= count($members)) {
+                    // Redis removes empty sets automatically; just unregister.
+                    $this->redis()->srem($this->tablesSet, $table);
+                }
+            }
+
+            $this->closeCircuit();
+
+            return $removed;
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'prune');
+
+            return 0;
+        }
+    }
+
+    /**
+     * Of the given cache keys, return those whose data hash no longer exists.
+     */
+    private function missingKeys(array $keys): array
+    {
+        $exists = $this->redis()->pipeline(function ($pipe) use ($keys) {
+            foreach ($keys as $key) {
+                $pipe->exists($this->buildFullKey($key));
+            }
+        });
+
+        $dead = [];
+        foreach ($keys as $i => $key) {
+            if (empty($exists[$i])) {
+                $dead[] = $key;
+            }
+        }
+
+        return $dead;
     }
 
     /**
@@ -666,7 +1096,7 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     private function getKeysFromTableIndexes(array $tables): array
     {
-        if (empty($tables)) {
+        if (empty($tables) || $this->circuitOpen()) {
             return [];
         }
 
@@ -679,69 +1109,26 @@ class RedisQueryCacheDriver implements QueryCacheDriver
 
             // Use SUNION to get all keys from all table indexes in one call
             if (count($indexKeys) === 1) {
-                $keys = $this->redis->smembers($indexKeys[0]);
+                $keys = $this->redis()->smembers($indexKeys[0]);
             } else {
-                $keys = $this->redis->sunion(...$indexKeys);
+                $keys = $this->redis()->sunion(...$indexKeys);
             }
+
+            $this->closeCircuit();
 
             return $keys ?: [];
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to get keys from table indexes', [
-                    'tables' => $tables,
-                    'error' => $e->getMessage()
-                ]);
-            }
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'getKeysFromTableIndexes');
+
+            // Invalidation could not see the index — always log: this is a
+            // correctness event (stale entries survive until TTL), not debug
+            // chatter. tripCircuit() above already logged the outage itself
+            // once per window.
+            Log::warning('Query Cache (Redis): could not read table indexes during invalidation; L2 entries may stay stale until TTL', [
+                'tables' => $tables,
+            ]);
+
             return [];
-        }
-    }
-
-    /**
-     * Remove a key from all its table indexes
-     *
-     * @param string $key
-     * @param array|null $tables Tables to remove from (if null, will be looked up from cache)
-     * @return void
-     */
-    private function removeKeyFromTableIndexes(string $key, ?array $tables = null): void
-    {
-        // If tables not provided, try to get them from the cached entry
-        if ($tables === null) {
-            $cached = $this->requestCache[$key] ?? null;
-            if ($cached && isset($cached['tables'])) {
-                $tables = $cached['tables'];
-            } else {
-                // Try to get from Redis
-                try {
-                    $fullKey = $this->buildFullKey($key);
-                    $tablesJson = $this->redis->hget($fullKey, 'tables');
-                    $tables = $tablesJson ? json_decode($tablesJson, true) : [];
-                } catch (\Exception $e) {
-                    $tables = [];
-                }
-            }
-        }
-
-        if (empty($tables)) {
-            return;
-        }
-
-        try {
-            // Use pipeline to remove key from all table indexes
-            $this->redis->pipeline(function ($pipe) use ($key, $tables) {
-                foreach ($tables as $table) {
-                    $indexKey = $this->tableIndexPrefix . $table;
-                    $pipe->srem($indexKey, $key);
-                }
-            });
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to remove key from table indexes', [
-                    'key' => $key,
-                    'tables' => $tables,
-                    'error' => $e->getMessage()
-                ]);
-            }
         }
     }
 
@@ -756,45 +1143,54 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     {
         // Clear L1 cache for these keys first
         foreach ($keys as $key) {
-            unset($this->requestCache[$key]);
+            $this->l1Forget($key);
+        }
+
+        if ($this->circuitOpen()) {
+            return;
         }
 
         try {
-            // Read each key's own table list so we can remove it from ALL of its
-            // table indexes — not just the tables that triggered this
-            // invalidation. Otherwise a key referencing [users, posts] that is
-            // invalidated via `users` lingers forever in the `posts` index.
-            $tablesByKey = $this->redis->pipeline(function ($pipe) use ($keys) {
-                foreach ($keys as $key) {
-                    $pipe->hget($this->buildFullKey($key), 'tables');
-                }
-            });
-
-            $this->redis->pipeline(function ($pipe) use ($keys, $affectedTables, $tablesByKey) {
-                foreach ($keys as $i => $key) {
-                    $pipe->del($this->buildFullKey($key));
-                    $pipe->srem($this->keysSet, $key);
-
-                    $raw = $tablesByKey[$i] ?? null;
-                    $ownTables = (is_string($raw) && $raw !== '') ? (json_decode($raw, true) ?: []) : [];
-
-                    // Union of the key's own tables and the invalidation's
-                    // tables (the latter covers already-expired keys whose
-                    // 'tables' field is gone).
-                    foreach (array_unique(array_merge($ownTables, $affectedTables)) as $table) {
-                        $pipe->srem($this->tableIndexPrefix . $table, $key);
+            foreach (array_chunk($keys, self::PIPELINE_CHUNK) as $chunk) {
+                // Read each chunk's table lists so we can remove each key from
+                // ALL of its table indexes — not just the tables that triggered
+                // this invalidation. Otherwise a key referencing [users, posts]
+                // that is invalidated via `users` lingers forever in the
+                // `posts` index.
+                $tablesByKey = $this->redis()->pipeline(function ($pipe) use ($chunk) {
+                    foreach ($chunk as $key) {
+                        $pipe->hget($this->buildFullKey($key), 'tables');
                     }
-                }
-            });
+                });
+
+                $this->redis()->pipeline(function ($pipe) use ($chunk, $affectedTables, $tablesByKey) {
+                    foreach ($chunk as $i => $key) {
+                        $pipe->del($this->buildFullKey($key));
+                        $pipe->srem($this->keysSet, $key);
+
+                        $raw = $tablesByKey[$i] ?? null;
+                        $ownTables = (is_string($raw) && $raw !== '') ? (json_decode($raw, true) ?: []) : [];
+
+                        // Union of the key's own tables and the invalidation's
+                        // tables (the latter covers already-expired keys whose
+                        // 'tables' field is gone).
+                        foreach (array_unique(array_merge($ownTables, $affectedTables)) as $table) {
+                            $pipe->srem($this->tableIndexPrefix . $table, $key);
+                        }
+                    }
+                });
+            }
 
             $this->closeCircuit();
         } catch (\Throwable $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to pipeline delete with index cleanup', [
-                    'keys_count' => count($keys),
-                    'error' => $e->getMessage()
-                ]);
-            }
+            $this->tripCircuit($e, 'pipelineDeleteWithIndexCleanup');
+
+            // A failed delete means stale data persists until TTL — always
+            // log it, not only when debug logging is enabled.
+            Log::warning('Query Cache (Redis): failed to delete invalidated keys; stale entries may persist until TTL', [
+                'keys_count' => count($keys),
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -812,11 +1208,13 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         }
 
         try {
-            $this->redis->pipeline(function ($pipe) use ($keys) {
-                foreach ($keys as $key) {
-                    $pipe->srem($this->keysSet, $key);
-                }
-            });
+            foreach (array_chunk($keys, self::PIPELINE_CHUNK) as $chunk) {
+                $this->redis()->pipeline(function ($pipe) use ($chunk) {
+                    foreach ($chunk as $key) {
+                        $pipe->srem($this->keysSet, $key);
+                    }
+                });
+            }
         } catch (\Throwable $e) {
             // Housekeeping only — ignore.
         }
@@ -829,16 +1227,19 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     private function getAllTrackedKeys(): array
     {
+        if ($this->circuitOpen()) {
+            return [];
+        }
+
         try {
             // Get all members from Set using SMEMBERS (AWS/Valkey compatible)
-            $keys = $this->redis->smembers($this->keysSet);
+            $keys = $this->redis()->smembers($this->keysSet);
+            $this->closeCircuit();
+
             return $keys ?: [];
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to get tracked keys', [
-                    'error' => $e->getMessage()
-                ]);
-            }
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'getAllTrackedKeys');
+
             return [];
         }
     }
@@ -861,12 +1262,14 @@ class RedisQueryCacheDriver implements QueryCacheDriver
         $this->pipelineDelete($keys);
 
         // Clear the tracking Set itself
-        try {
-            $this->redis->del($this->keysSet);
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to clear tracking set', [
-                    'error' => $e->getMessage()
+        if (!$this->circuitOpen()) {
+            try {
+                $this->redis()->del($this->keysSet);
+                $this->closeCircuit();
+            } catch (\Throwable $e) {
+                $this->tripCircuit($e, 'clearAllTrackedKeys');
+                Log::warning('Query Cache (Redis): failed to clear tracking set during flush', [
+                    'error' => $e->getMessage(),
                 ]);
             }
         }
@@ -888,25 +1291,32 @@ class RedisQueryCacheDriver implements QueryCacheDriver
      */
     private function clearAllTableIndexes(): void
     {
+        if ($this->circuitOpen()) {
+            return;
+        }
+
         try {
-            $tables = $this->redis->smembers($this->tablesSet);
+            $tables = $this->redis()->smembers($this->tablesSet);
 
             if (empty($tables)) {
                 return;
             }
 
-            $this->redis->pipeline(function ($pipe) use ($tables) {
-                foreach ($tables as $table) {
-                    $pipe->del($this->tableIndexPrefix . $table);
-                }
-                $pipe->del($this->tablesSet);
-            });
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to clear table indexes', [
-                    'error' => $e->getMessage()
-                ]);
+            foreach (array_chunk($tables, self::PIPELINE_CHUNK) as $chunk) {
+                $this->redis()->pipeline(function ($pipe) use ($chunk) {
+                    foreach ($chunk as $table) {
+                        $pipe->del($this->tableIndexPrefix . $table);
+                    }
+                });
             }
+            $this->redis()->del($this->tablesSet);
+
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'clearAllTableIndexes');
+            Log::warning('Query Cache (Redis): failed to clear table indexes during flush', [
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -961,24 +1371,33 @@ class RedisQueryCacheDriver implements QueryCacheDriver
     {
         // Clear L1 cache for these keys first (critical for same-request consistency)
         foreach ($keys as $key) {
-            unset($this->requestCache[$key]);
+            $this->l1Forget($key);
+        }
+
+        if ($this->circuitOpen()) {
+            return;
         }
 
         try {
-            // Pipeline DELETE operations and tracking Set removal in one pipeline
-            $this->redis->pipeline(function ($pipe) use ($keys) {
-                foreach ($keys as $key) {
-                    $fullKey = $this->buildFullKey($key);
-                    $pipe->del($fullKey);
-                    $pipe->srem($this->keysSet, $key);
-                }
-            });
-        } catch (\Exception $e) {
-            if ($this->config['log_enabled']) {
-                Log::warning('Query Cache (Redis): Failed to pipeline DELETE', [
-                    'error' => $e->getMessage()
-                ]);
+            // Pipeline DELETE operations and tracking Set removal, chunked so a
+            // huge flush can't buffer an unbounded command burst.
+            foreach (array_chunk($keys, self::PIPELINE_CHUNK) as $chunk) {
+                $this->redis()->pipeline(function ($pipe) use ($chunk) {
+                    foreach ($chunk as $key) {
+                        $fullKey = $this->buildFullKey($key);
+                        $pipe->del($fullKey);
+                        $pipe->srem($this->keysSet, $key);
+                    }
+                });
             }
+
+            $this->closeCircuit();
+        } catch (\Throwable $e) {
+            $this->tripCircuit($e, 'pipelineDelete');
+            Log::warning('Query Cache (Redis): failed to pipeline DELETE; stale entries may persist until TTL', [
+                'keys_count' => count($keys),
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 }

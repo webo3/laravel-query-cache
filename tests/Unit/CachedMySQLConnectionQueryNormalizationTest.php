@@ -84,18 +84,11 @@ class CachedMySQLConnectionQueryNormalizationTest extends TestCase
         // Enable caching
         $this->connection->enableQueryCache();
 
-        // Scenario: Different developers writing queries in different styles
-        // Before normalization: These would create 12 separate cache entries
-        // After normalization: All hit the same cache (1 entry, 11 hits)
+        // Whitespace differences (the safe normalization) must collapse to one
+        // cache entry. Case is intentionally NOT folded — see
+        // test_identifier_case_creates_distinct_cache_entries.
 
-        // Developer 1 prefers lowercase
-        $this->connection->select('select * from demo_table where id = ?', [1]);
-
-        // Developer 2 prefers uppercase
         $this->connection->select('SELECT * FROM demo_table WHERE id = ?', [1]);
-
-        // Developer 3 uses mixed case
-        $this->connection->select('Select * From demo_table Where id = ?', [1]);
 
         // ORM might add extra spaces
         $this->connection->select('SELECT  *  FROM  demo_table  WHERE  id = ?', [1]);
@@ -112,27 +105,37 @@ class CachedMySQLConnectionQueryNormalizationTest extends TestCase
         // Multiple newlines and spaces
         $this->connection->select("SELECT   *\n\n  FROM   demo_table\n  WHERE   id = ?", [1]);
 
-        // Another developer's style
-        $this->connection->select('sElEcT * fRoM demo_table wHeRe id = ?', [1]);
-
         // Copy-pasted query with extra whitespace
         $this->connection->select('    SELECT * FROM demo_table WHERE id = ?    ', [1]);
 
         // IDE auto-formatted
         $this->connection->select("SELECT\n    *\nFROM\n    demo_table\nWHERE\n    id = ?", [1]);
 
-        // Final variation
-        $this->connection->select('SELECT * from DEMO_TABLE where ID = ?', [1]);
-
         $stats = $this->connection->getCacheStats();
 
         // Assert - All queries should hit the same cache entry
         $this->assertEquals(1, $stats['cached_queries_count'], 'Should have only 1 cached query');
-        $this->assertEquals(11, $stats['total_cache_hits'], 'Should have 11 cache hits (12 queries - 1 initial cache)');
+        $this->assertEquals(7, $stats['total_cache_hits'], 'Should have 7 cache hits (8 queries - 1 initial cache)');
+    }
 
-        // Calculate efficiency improvement
-        $cacheHitRate = ($stats['total_cache_hits'] / 12) * 100;
-        $this->assertGreaterThan(90, $cacheHitRate, 'Cache hit rate should be > 90%');
+    /**
+     * Identifier case must NOT be folded: on case-sensitive systems (MySQL
+     * with lower_case_table_names=0) demo_table and DEMO_TABLE are different
+     * tables, and folding case would alias them to one cache key — a
+     * collision serving the wrong table's rows.
+     */
+    public function test_identifier_case_creates_distinct_cache_entries()
+    {
+        $this->connection->enableQueryCache();
+
+        $this->connection->select('SELECT * FROM demo_table WHERE id = ?', [1]);
+        $this->connection->select('select * from demo_table where id = ?', [1]);
+        $this->connection->select('SELECT * FROM DEMO_TABLE WHERE id = ?', [1]);
+
+        $stats = $this->connection->getCacheStats();
+
+        $this->assertEquals(3, $stats['cached_queries_count']);
+        $this->assertEquals(0, $stats['total_cache_hits']);
     }
 
     /**
@@ -166,7 +169,7 @@ class CachedMySQLConnectionQueryNormalizationTest extends TestCase
 
         // Same query but different parameters
         $this->connection->select('SELECT * FROM demo_table WHERE id = ?', [1]);
-        $this->connection->select('select * from demo_table where id = ?', [2]); // Different case but different binding
+        $this->connection->select('SELECT * FROM demo_table WHERE id = ?', [2]); // Same query, different binding
 
         $stats = $this->connection->getCacheStats();
 
@@ -175,7 +178,7 @@ class CachedMySQLConnectionQueryNormalizationTest extends TestCase
         $this->assertEquals(0, $stats['total_cache_hits']);
 
         // Same query and same binding should hit cache
-        $this->connection->select('SeLeCt * FrOm demo_table WhErE id = ?', [1]); // Different case but same binding
+        $this->connection->select('SELECT * FROM demo_table WHERE id = ?', [1]); // Same query, same binding
 
         $statsAfter = $this->connection->getCacheStats();
         $this->assertEquals(2, $statsAfter['cached_queries_count']);

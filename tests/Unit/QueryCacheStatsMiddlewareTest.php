@@ -44,11 +44,24 @@ class QueryCacheStatsMiddlewareTest extends TestCase
         Log::shouldReceive('info')->never();
 
         $request = Request::create('/test', 'GET');
+        $response = $this->runMiddleware($request);
+
+        $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    /**
+     * Run the middleware the way the kernel does: handle(), then terminate()
+     * after the response has been "sent" — stats are collected in terminate().
+     */
+    private function runMiddleware(Request $request): Response
+    {
         $response = $this->middleware->handle($request, function () {
             return new Response('OK');
         });
 
-        $this->assertEquals(200, $response->getStatusCode());
+        $this->middleware->terminate($request, $response);
+
+        return $response;
     }
 
     #[Test]
@@ -92,9 +105,7 @@ class QueryCacheStatsMiddlewareTest extends TestCase
             });
 
         $request = Request::create('/test', 'GET');
-        $this->middleware->handle($request, function () {
-            return new Response('OK');
-        });
+        $this->runMiddleware($request);
 
         // Cleanup
         $connection->statement('DROP TABLE IF EXISTS test_middleware');
@@ -125,9 +136,7 @@ class QueryCacheStatsMiddlewareTest extends TestCase
         Log::shouldReceive('info')->never();
 
         $request = Request::create('/test', 'GET');
-        $this->middleware->handle($request, function () {
-            return new Response('OK');
-        });
+        $this->runMiddleware($request);
     }
 
     #[Test]
@@ -147,9 +156,7 @@ class QueryCacheStatsMiddlewareTest extends TestCase
             });
 
         $request = Request::create('/test', 'GET');
-        $response = $this->middleware->handle($request, function () {
-            return new Response('OK');
-        });
+        $response = $this->runMiddleware($request);
 
         // Middleware should not break the response even on error
         $this->assertEquals(200, $response->getStatusCode());
@@ -184,10 +191,47 @@ class QueryCacheStatsMiddlewareTest extends TestCase
         Log::shouldReceive('info')->once();
 
         $request = Request::create('/test', 'GET');
-        $this->middleware->handle($request, function () {
-            return new Response('OK');
-        });
+        $this->runMiddleware($request);
 
         $connection->statement('DROP TABLE IF EXISTS test_multi');
+    }
+
+    #[Test]
+    public function it_parses_comma_separated_connection_lists()
+    {
+        // Regression: 'a,b' used to be passed verbatim to DB::connection(),
+        // which threw on every request and stats were never logged.
+        config([
+            'db-cache.enabled' => true,
+            'db-cache.log_enabled' => true,
+            'db-cache.driver' => 'array',
+            'db-cache.connection' => 'sqlite, nonexistent_connection',
+            'database.connections.sqlite.db_cache.enabled' => true,
+            'database.connections.sqlite.db_cache.driver' => 'array',
+            'database.connections.sqlite.db_cache.ttl' => 300,
+            'database.connections.sqlite.db_cache.max_size' => 1000,
+            'database.connections.sqlite.db_cache.log_enabled' => false,
+        ]);
+
+        app('db')->purge('sqlite');
+        $connection = DB::connection('sqlite');
+
+        if (!$connection instanceof CachedConnection) {
+            $this->markTestSkipped('CachedConnection not configured');
+        }
+
+        $connection->statement('CREATE TABLE IF NOT EXISTS test_commas (id INTEGER PRIMARY KEY, name TEXT)');
+        $connection->insert('INSERT INTO test_commas (name) VALUES (?)', ['Test']);
+        $connection->select('SELECT * FROM test_commas');
+
+        // The sqlite stats get logged; the unknown second connection only
+        // produces the caught warning, not a fatal.
+        Log::shouldReceive('info')->once();
+        Log::shouldReceive('warning')->once();
+
+        $request = Request::create('/test', 'GET');
+        $this->runMiddleware($request);
+
+        $connection->statement('DROP TABLE IF EXISTS test_commas');
     }
 }

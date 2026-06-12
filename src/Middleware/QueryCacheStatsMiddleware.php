@@ -3,8 +3,8 @@
 namespace webO3\LaravelDbCache\Middleware;
 
 use webO3\LaravelDbCache\Contracts\CachedConnection;
+use webO3\LaravelDbCache\Support\ConfigList;
 use Closure;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -13,6 +13,9 @@ use Illuminate\Support\Facades\Log;
  *
  * Logs cache hit rates and query counts at the end of each request.
  * Useful for monitoring cache effectiveness.
+ *
+ * Stats are collected in terminate(), after the response has been sent,
+ * so the (potentially expensive) Redis sweep never adds request latency.
  */
 class QueryCacheStatsMiddleware
 {
@@ -25,14 +28,21 @@ class QueryCacheStatsMiddleware
      */
     public function handle($request, Closure $next)
     {
-        $response = $next($request);
+        return $next($request);
+    }
 
-        // Log statistics if enabled in config
+    /**
+     * Collect and log stats after the response has been sent to the client.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  mixed  $response
+     * @return void
+     */
+    public function terminate($request, $response): void
+    {
         if (config('db-cache.log_enabled', false)) {
             $this->logCacheStats($request);
         }
-
-        return $response;
     }
 
     /**
@@ -44,15 +54,13 @@ class QueryCacheStatsMiddleware
     private function logCacheStats($request): void
     {
         try {
-            $connections = Arr::wrap(config('db-cache.connection', 'mysql'));
-
-            foreach ($connections as $connectionName) {
+            foreach (ConfigList::cachedConnections() as $connectionName) {
                 $connection = DB::connection($connectionName);
 
                 if ($connection instanceof CachedConnection) {
                     $stats = $connection->getCacheStats();
 
-                    if ($stats['cached_queries_count'] > 0) {
+                    if ($stats['cached_queries_count'] > 0 || ($stats['request_hits'] ?? 0) > 0 || ($stats['request_misses'] ?? 0) > 0) {
                         Log::info('Query Cache Statistics', [
                             'connection' => $connectionName,
                             'driver' => $stats['driver'],
@@ -60,6 +68,8 @@ class QueryCacheStatsMiddleware
                             'method' => $request->method(),
                             'cached_queries' => $stats['cached_queries_count'],
                             'total_hits' => $stats['total_cache_hits'],
+                            'request_hits' => $stats['request_hits'] ?? 0,
+                            'request_misses' => $stats['request_misses'] ?? 0,
                             'hit_rate' => $this->calculateHitRate($stats),
                         ]);
                     }
@@ -74,22 +84,22 @@ class QueryCacheStatsMiddleware
     }
 
     /**
-     * Calculate cache hit rate
+     * Calculate the hit rate from this request's own hit/miss counters —
+     * lifetime hit totals against current key counts said nothing about the
+     * request being logged.
      *
      * @param array $stats
      * @return string
      */
     private function calculateHitRate(array $stats): string
     {
-        $cachedQueries = $stats['cached_queries_count'];
-        $totalHits = $stats['total_cache_hits'];
+        $hits = (int) ($stats['request_hits'] ?? 0);
+        $misses = (int) ($stats['request_misses'] ?? 0);
 
-        if ($cachedQueries === 0) {
+        if ($hits + $misses === 0) {
             return '0%';
         }
 
-        $hitRate = ($totalHits / ($cachedQueries + $totalHits)) * 100;
-
-        return number_format($hitRate, 2) . '%';
+        return number_format(($hits / ($hits + $misses)) * 100, 2) . '%';
     }
 }

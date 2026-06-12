@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0]
+
+### Security
+
+- **Octane/queue-worker tenant isolation:** `flushRequestCache()` (wired to request/job boundaries) now resets the tenant context, so the `tenant_required` fail-safe holds on every request of a long-running worker — previously a request that forgot `setTenantContext()` silently read the previous request's tenant cache
+- **HMAC-authenticated Redis payloads:** cached results are signed with `APP_KEY` (HMAC-SHA256) and authenticated *before* unserialization, closing the object-injection gap left by igbinary (which has no `allowed_classes` filter). Pre-HMAC entries decode as misses (one-time cold-cache wave on upgrade)
+- Cache keys now use `sha256` instead of the non-collision-resistant `xxh128` — bindings are user-influenced, and a crafted collision on a shared cache could serve one query's rows to another
+- Tenant IDs are validated (`[A-Za-z0-9._-]+`) before being embedded in Redis key namespaces; IDs containing `:` could overlap another tenant's namespace structure
+
+### Fixed
+
+- **Mutations executed while iterating `cursor()` now invalidate the cache** — the in-cursor flag is scoped to the cursor's own SELECT instead of the whole consuming loop (which also means unrelated SELECTs inside the loop are cached normally again)
+- **`pretend()` no longer poisons the cache:** pretended SELECTs return `[]` without executing; caching that handed real callers an empty result until TTL
+- **L1 cache is invalidated even when Redis is unreachable:** the request-level cache keeps its own inverted table index, so a same-request mutation purges matching L1 entries while the circuit breaker is open (previously they served stale rows)
+- `forget()` reads the entry's table list *before* deleting the hash — the index cleanup silently no-oped and leaked index members
+- `SELECT … INTO` (Postgres table creation, MySQL OUTFILE/@var) and nondeterministic SELECTs (`NOW()`, `RAND()`, `UUID()`, `nextval()`, `LAST_INSERT_ID()`, …) are never cached — a cache hit would skip the side effect or freeze the value
+- `LOAD DATA` / `LOAD XML` (MySQL) and `COPY` (Postgres) are classified as mutations and their target tables extracted, so bulk loads invalidate
+- Identifier case is no longer folded into one cache key (`FROM Users` vs `FROM users` are different tables on case-sensitive MySQL); whitespace normalization is unchanged
+- The stats middleware parses comma-separated `DB_QUERY_CACHE_CONNECTION` lists (it previously threw on every request for multi-connection setups), collects stats in `terminate()` after the response is sent, and reports an honest per-request hit rate from new request hit/miss counters
+- `db-cache:clear` without `--tenant` now clears every tenant namespace via a tenant registry set (previously tenant-namespaced entries silently survived)
+- CTE aliases are filtered from extracted tables case-insensitively; quoted identifiers containing spaces/hyphens/dots are extracted correctly
+- Invalidation failures are always logged (warning), not only when debug logging is enabled
+- Array driver enforces `ttl` on read (it was silently ignored) and resets its tenant context at request boundaries
+
+### Added
+
+- `db-cache:prune` command (+ `pruneQueryCache()` / `pruneExpired()` API) to reconcile tracking sets and table indexes with expired entries — schedule it hourly on busy apps
+- Tracking/index sets carry their own TTL (2× data TTL, refreshed on put) so read-mostly tables can't accumulate dead references forever
+- `max_result_bytes` (`DB_QUERY_CACHE_MAX_RESULT_BYTES`, default 1 MiB): oversized results are served from L1 but never written to Redis
+- All tracking/index set keys now carry the same app/cache prefix as data keys, so two apps sharing one Redis database can no longer destroy each other's indexes
+
+### Changed
+
+- The Redis connection is resolved lazily on first use — a missing/unreachable Redis config no longer throws while the database connection is being constructed (it degrades to "no caching" via the circuit breaker)
+- The circuit breaker now covers every Redis code path (invalidation and maintenance included) with client-agnostic `\Throwable` handling; large pipelines are chunked (500 commands)
+- With stats logging enabled, `recordHit()` updates the L1 entry in place instead of evicting it (evicting forced every repeat query back to Redis, doubling traffic in logging mode)
+- Invalidations inside a transaction are aggregated per distinct table — a 10k-statement bulk import schedules one commit-time invalidation per table, not one per statement; pending state is reset on rollback (worst case: a duplicate invalidation, never a missed one)
+- The per-request L1 flush for HTTP runs via the container's `terminating()` callback (after terminable middleware) instead of `RequestHandled`
+- **Upgrade notes:** the key-hash (sha256), HMAC payload format, and prefixed set names invalidate existing Redis entries and orphan old (unprefixed) tracking sets on deploy — a one-time cold-cache wave; delete old `db_cache:*` sets manually if you want the memory back immediately. `QueryCacheDriver` gained `pruneExpired(): int` and `CachedConnection` gained `pruneQueryCache(): int` (implement them if you have a custom driver). `setTenantContext()` now throws `InvalidArgumentException` for IDs with characters outside `[A-Za-z0-9._-]`.
+
 ## [1.2.0]
 
 ### Security

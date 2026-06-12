@@ -89,13 +89,23 @@ interface QueryCacheDriver
     public function setTenantContext(string $tenantId): void;
 
     /**
-     * Flush request-scoped state (L1 cache, per-process static caches).
+     * Flush request-scoped state (L1 cache, per-process static caches,
+     * tenant context, per-request counters).
      *
      * Called at request / job / Octane request boundaries so that
      * long-running workers (Horizon, FrankenPHP) don't accumulate L1
-     * entries that outlive their intended TTL. Does not touch L2 (Redis).
+     * entries that outlive their intended TTL — or carry one request's
+     * tenant context into the next. Does not touch L2 (Redis).
      *
      * @return void
      */
     public function flushRequestCache(): void;
+
+    /**
+     * Reconcile bookkeeping with expired entries (e.g. remove tracking-set
+     * and index members whose underlying data has expired).
+     *
+     * @return int Number of stale references removed
+     */
+    public function pruneExpired(): int;
 }
